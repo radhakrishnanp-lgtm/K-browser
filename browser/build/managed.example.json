@@ -1,0 +1,5 @@
+{
+  "serverUrl": "https://192.168.1.10:8443",
+  "fingerprint": "PASTE:THE:SHA256:FINGERPRINT:FROM:THE:ADMIN:CONSOLE",
+  "lockServer": true
+}

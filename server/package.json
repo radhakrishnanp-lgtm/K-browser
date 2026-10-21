@@ -1,0 +1,22 @@
+{
+  "name": "kbrowser-server",
+  "version": "1.0.0",
+  "description": "K-Browser Control Server: central admin, credential vault and web filtering for K-Browser clients on your LAN",
+  "main": "src/index.js",
+  "bin": {
+    "kbrowser-server": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "reset-admin": "node src/index.js reset-admin",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "selfsigned": "^5.5.0"
+  }
+}

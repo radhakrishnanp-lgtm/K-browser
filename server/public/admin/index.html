@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>K-Browser Admin Console</title>
+  <link rel="icon" href="favicon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="login-view" class="login-view" hidden>
+    <form id="login-form" class="login-card">
+      <div class="brand"><span class="logo">K</span> K-Browser Admin</div>
+      <label>Username <input name="username" autocomplete="username" required autofocus></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <div class="error" id="login-error"></div>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <div id="app-view" class="app" hidden>
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">K</span> <span id="org-name">K-Browser</span></div>
+      <nav id="nav">
+        <a href="#dashboard">Dashboard</a>
+        <a href="#sessions">Live sessions</a>
+        <a href="#users">Users</a>
+        <a href="#groups">Groups</a>
+        <a href="#credentials">Site logins</a>
+        <a href="#filter">Web filter</a>
+        <a href="#bookmarks">Bookmarks</a>
+        <a href="#activity">Activity log</a>
+        <a href="#settings">Settings</a>
+        <a href="#deploy">Deploy clients</a>
+      </nav>
+      <div class="me">
+        <span id="me-name"></span>
+        <button id="change-pw" class="link">Change password</button>
+        <button id="logout" class="link">Sign out</button>
+      </div>
+    </aside>
+    <main id="main"></main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

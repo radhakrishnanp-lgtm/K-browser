@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src * data:">
+  <title>K-Browser</title>
+  <link rel="stylesheet" href="browser.css">
+</head>
+<body>
+  <div id="chrome">
+    <div id="tabstrip">
+      <div id="tabs" role="tablist"></div>
+      <button id="new-tab" class="icon" title="New tab (Ctrl+T)">+</button>
+    </div>
+    <div id="toolbar">
+      <button id="back" class="icon" title="Back (Alt+Left)">&#x2190;</button>
+      <button id="forward" class="icon" title="Forward (Alt+Right)">&#x2192;</button>
+      <button id="reload" class="icon" title="Reload (F5)">&#x21bb;</button>
+      <button id="home" class="icon" title="Home">&#x2302;</button>
+      <form id="omnibox">
+        <span id="lock" title=""></span>
+        <input id="address" spellcheck="false" autocomplete="off" placeholder="Search or enter address">
+        <span id="zoom" hidden></span>
+        <button type="button" id="key" class="chip" hidden title="Managed sign-in for this site">&#x1f511; <span id="key-label">Managed login</span></button>
+      </form>
+      <button id="downloads" class="icon" title="Downloads">&#x2193;<span id="dl-count" class="count" hidden></span></button>
+      <span id="status" class="status" title=""></span>
+      <button id="menu" class="user" title="Menu"><span id="avatar"></span><span id="username"></span> &#x22ee;</button>
+    </div>
+    <div id="bookmarks"></div>
+    <div id="notices"></div>
+    <form id="findbar" hidden>
+      <input id="find-input" placeholder="Find in page" spellcheck="false">
+      <span id="find-count"></span>
+      <button type="button" id="find-prev" class="icon">&#x2191;</button>
+      <button type="button" id="find-next" class="icon">&#x2193;</button>
+      <button type="button" id="find-close" class="icon">&#x2715;</button>
+    </form>
+    <form id="pwform" hidden>
+      <strong>Change your K-Browser password</strong>
+      <input id="pw-cur" type="password" placeholder="Current password" required>
+      <input id="pw-new" type="password" placeholder="New password (8+)" minlength="8" required>
+      <button type="submit">Save</button>
+      <button type="button" id="pw-cancel">Cancel</button>
+      <span id="pw-msg"></span>
+    </form>
+  </div>
+  <script src="browser.js"></script>
+</body>
+</html>
