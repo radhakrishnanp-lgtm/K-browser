@@ -1,0 +1,28 @@
+# systemd unit for the K-Browser Control Server (Linux).
+# Install:
+#   sudo useradd --system --home /opt/kbrowser-server kbrowser
+#   sudo cp -r server /opt/kbrowser-server && cd /opt/kbrowser-server && sudo npm ci --omit=dev
+#   sudo chown -R kbrowser: /opt/kbrowser-server
+#   sudo cp deploy/kbrowser-server.service /etc/systemd/system/
+#   sudo systemctl enable --now kbrowser-server
+#   sudo journalctl -u kbrowser-server   # shows the first admin password
+[Unit]
+Description=K-Browser Control Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=kbrowser
+WorkingDirectory=/opt/kbrowser-server
+Environment=KB_DATA_DIR=/opt/kbrowser-server/data
+Environment=KB_PORT=8443
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

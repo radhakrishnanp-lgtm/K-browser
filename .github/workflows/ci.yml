@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  server-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: server
+      - run: npm test
+        working-directory: server
+
+  browser-e2e:
+    needs: server-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: server
+      - run: npm ci
+        working-directory: browser
+      - name: End-to-end test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s "-screen 0 1400x900x24" npm run test:e2e
+        working-directory: browser
+      - name: End-to-end test (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:e2e
+        working-directory: browser
+
+  package:
+    needs: browser-e2e
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: --win
+          - os: ubuntu-latest
+            target: --linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: browser
+      - run: npx electron-builder ${{ matrix.target }} --publish never
+        working-directory: browser
+      - uses: actions/upload-artifact@v4
+        with:
+          name: K-Browser-${{ runner.os }}
+          path: |
+            browser/dist/*.exe
+            browser/dist/*.AppImage
+            browser/dist/*.deb
+          if-no-files-found: error

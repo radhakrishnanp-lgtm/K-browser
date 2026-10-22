@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>New tab</title>
+  <link rel="stylesheet" href="page.css">
+</head>
+<body>
+  <div class="wrap">
+    <div class="center">
+      <h1 id="greeting">Welcome</h1>
+      <div class="muted" id="org"></div>
+    </div>
+    <form class="search" id="search">
+      <input id="q" placeholder="Search the web" autofocus autocomplete="off">
+      <button type="submit">Search</button>
+    </form>
+    <section id="apps-section" hidden>
+      <h2>Your apps — signed in automatically</h2>
+      <div class="grid" id="apps"></div>
+    </section>
+    <section id="bm-section" hidden>
+      <h2>Bookmarks</h2>
+      <div class="grid" id="bookmarks"></div>
+    </section>
+  </div>
+  <script src="newtab.js"></script>
+</body>
+</html>

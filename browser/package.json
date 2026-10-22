@@ -1,0 +1,85 @@
+{
+  "name": "k-browser",
+  "productName": "K-Browser",
+  "version": "1.0.0",
+  "description": "K-Browser: centrally managed Chromium-based workplace browser",
+  "homepage": "https://github.com/radhakrishnanp-lgtm/K-browser",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/radhakrishnanp-lgtm/K-browser.git"
+  },
+  "main": "src/main/main.js",
+  "author": {
+    "name": "K-Browser",
+    "email": "noreply@example.com"
+  },
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test:e2e": "node test/e2e.js",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.kbrowser.client",
+    "productName": "K-Browser",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/managed.example.json",
+        "to": "managed.example.json"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "artifactName": "K-Browser-Setup-${version}.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Network",
+      "icon": "build/icon.png",
+      "maintainer": "K-Browser <noreply@example.com>",
+      "artifactName": "K-Browser-${version}-${arch}.${ext}"
+    },
+    "publish": null,
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.9.3",
+    "electron-builder": "^26.15.3",
+    "playwright-core": "^1.64.1"
+  }
+}

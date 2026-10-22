@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'">
+  <title>K-Browser — Sign in</title>
+  <link rel="stylesheet" href="login.css">
+</head>
+<body>
+  <main class="card">
+    <div class="brand"><span class="logo">K</span><div><div class="title">K-Browser</div><div class="org" id="org">Secure workplace browser</div></div></div>
+
+    <form id="signin">
+      <div id="server-row">
+        <label for="server">Server</label>
+        <div class="inline">
+          <input id="server" placeholder="192.168.1.10:8443" autocomplete="off" spellcheck="false">
+          <button type="button" id="find">Find</button>
+        </div>
+        <div id="found" class="found" hidden></div>
+      </div>
+      <div id="server-locked" class="locked" hidden></div>
+
+      <label for="username">Username</label>
+      <input id="username" autocomplete="username" spellcheck="false" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+
+      <div id="banner" class="banner" hidden></div>
+      <div id="error" class="error" role="alert"></div>
+      <button class="primary" id="submit" type="submit">Sign in</button>
+    </form>
+
+    <section id="trust" hidden>
+      <h2 id="trust-title">Trust this server?</h2>
+      <p id="trust-text">This is the first time this computer connects to <strong id="trust-server"></strong>. Check that the fingerprint below matches the one shown in the Admin Console (Deploy clients page).</p>
+      <code id="trust-fp" class="fp"></code>
+      <div class="actions">
+        <button type="button" id="trust-cancel">Cancel</button>
+        <button type="button" class="primary" id="trust-ok">Trust &amp; sign in</button>
+      </div>
+    </section>
+
+    <form id="newpw" hidden>
+      <h2>Choose a new password</h2>
+      <p>Your administrator asks you to replace your initial password.</p>
+      <label for="np1">New password (8+ characters)</label>
+      <input id="np1" type="password" autocomplete="new-password" minlength="8" required>
+      <label for="np2">Repeat new password</label>
+      <input id="np2" type="password" autocomplete="new-password" required>
+      <div id="np-error" class="error"></div>
+      <button class="primary" type="submit">Save and continue</button>
+    </form>
+
+    <footer id="footer"></footer>
+  </main>
+  <script src="login.js"></script>
+</body>
+</html>
