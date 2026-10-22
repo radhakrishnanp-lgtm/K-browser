@@ -13,10 +13,14 @@
       <p class="muted" id="text">Your administrator does not allow access to this site from K-Browser.</p>
       <div class="url" id="url"></div>
       <div class="muted" id="rule"></div>
-      <div class="actions">
-        <button class="btn secondary" id="back" type="button">Go back</button>
-        <button class="btn" id="request" type="button">Request access</button>
-      </div>
+      <form id="request-form" class="request">
+        <textarea id="reason" maxlength="500" placeholder="Why do you need this site? (sent to your administrator)"></textarea>
+        <div class="actions">
+          <button class="btn secondary" id="back" type="button">Go back</button>
+          <button class="btn" id="request" type="submit">Request access</button>
+        </div>
+      </form>
+      <div class="actions" id="back-only" hidden><button class="btn secondary" id="back2" type="button">Go back</button></div>
       <p class="muted" id="sent" hidden>Your request was sent to the administrator.</p>
     </div>
   </div>

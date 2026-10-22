@@ -122,12 +122,18 @@ class Controller {
     return { serverUrl, fingerprint, status, name: info.name, banner: info.loginBanner || '' };
   }
 
-  async login({ serverUrl, username, password }) {
+  async login({ serverUrl, username, password, otp }) {
     const target = normalizeServerUrl(serverUrl);
     if (!this.pending || this.pending.serverUrl !== target) await this.probe(target);
     const { certPem, fingerprint } = this.pending;
     const client = new ServerClient({ serverUrl: target, certPem, fingerprint });
-    const res = await client.request('POST', '/api/auth/login', { username, password, kind: 'browser', device: os.hostname() });
+    let res;
+    try {
+      res = await client.request('POST', '/api/auth/login', { username, password, otp: otp || undefined, kind: 'browser', device: os.hostname() });
+    } catch (err) {
+      if (err.body && err.body.needOtp) return { needOtp: true, message: err.message };
+      throw err;
+    }
     client.token = res.token;
     this.config.set({ serverUrl: target, certPem, fingerprint, lastUsername: username });
     this.config.setToken(res.token);

@@ -26,6 +26,11 @@
       <label for="password">Password</label>
       <input id="password" type="password" autocomplete="current-password" required>
 
+      <div id="otp-row" hidden>
+        <label for="otp">Authenticator code</label>
+        <input id="otp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456">
+      </div>
+
       <div id="banner" class="banner" hidden></div>
       <div id="error" class="error" role="alert"></div>
       <button class="primary" id="submit" type="submit">Sign in</button>

@@ -1,7 +1,7 @@
 {
   "name": "k-browser",
   "productName": "K-Browser",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "K-Browser: centrally managed Chromium-based workplace browser",
   "homepage": "https://github.com/radhakrishnanp-lgtm/K-browser",
   "repository": {

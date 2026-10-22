@@ -38,9 +38,10 @@ function fetchCertificate(serverUrl, timeoutMs = 6000) {
 }
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, body = null) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -89,7 +90,7 @@ class ServerClient {
               data = { error: text };
             }
             if (res.statusCode >= 200 && res.statusCode < 300) resolve(data);
-            else reject(new HttpError(res.statusCode, (data && data.error) || `Server error ${res.statusCode}`));
+            else reject(new HttpError(res.statusCode, (data && data.error) || `Server error ${res.statusCode}`, data));
           });
         }
       );

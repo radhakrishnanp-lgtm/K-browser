@@ -78,6 +78,9 @@ function publicCredential(c, priority) {
     autoSubmit: !!c.autoSubmit,
     showOnNewTab: c.showOnNewTab !== false,
     hasTotp: !!c.totpEnc,
+    hasSession: !!c.sessionEnc,
+    sessionVersion: c.sessionCapturedAt || '',
+    seats: Number(c.seats) || 0,
     priority,
   };
 }
@@ -89,7 +92,26 @@ function credentialAllowedForUser(store, user, credentialId, url) {
   return entry.credential;
 }
 
+// Data-protection rules that apply to this user (everyone, their groups, or them).
+function dlpRulesForUser(store, user) {
+  const groupIds = new Set(user.groupIds || []);
+  return (store.data.dlpRules || [])
+    .filter((r) => r.enabled !== false && (r.everyone || (r.userIds || []).includes(user.id) || (r.groupIds || []).some((g) => groupIds.has(g))))
+    .map((r) => ({
+      name: r.name,
+      match: r.match || [],
+      blockCopy: !!r.blockCopy,
+      blockPaste: !!r.blockPaste,
+      blockPrint: !!r.blockPrint,
+      blockDownload: !!r.blockDownload,
+      blockUpload: !!r.blockUpload,
+      watermark: !!r.watermark,
+      screenshotProtect: !!r.screenshotProtect,
+    }));
+}
+
 module.exports = {
+  dlpRulesForUser,
   effectivePolicy,
   effectiveSettings,
   effectiveBookmarks,

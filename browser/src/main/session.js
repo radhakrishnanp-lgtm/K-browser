@@ -15,6 +15,26 @@ function cleanUserAgent(ua) {
     .replace(/\sK-Browser\/[\d.]+/, '');
 }
 
+// Forces SafeSearch on Google, Bing and DuckDuckGo result pages.
+function safeSearchUrl(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.toLowerCase();
+  const set = (k, v) => {
+    if (u.searchParams.get(k) === v) return null;
+    u.searchParams.set(k, v);
+    return u.href;
+  };
+  if (/(^|\.)google\.[a-z.]{2,6}$/.test(host) && /^\/(search|images|webhp)?/.test(u.pathname) && u.searchParams.has('q')) return set('safe', 'active');
+  if (/(^|\.)bing\.com$/.test(host) && u.pathname.startsWith('/search')) return set('adlt', 'strict');
+  if (/(^|\.)duckduckgo\.com$/.test(host) && u.searchParams.has('q')) return set('kp', '1');
+  return null;
+}
+
 function pemBody(pem) {
   return String(pem || '').replace(/-----[^-]+-----|\s/g, '');
 }
@@ -59,15 +79,39 @@ function configureSession(partition, ctx) {
     const c = ctx();
     if (!c) return callback({ cancel: true });
     const type = details.resourceType;
-    if (type !== 'mainFrame' && type !== 'subFrame') return callback({});
     const url = details.url;
+    if (c.settings.safeSearch && (type === 'mainFrame' || type === 'subFrame' || type === 'xhr')) {
+      const safe = safeSearchUrl(url);
+      if (safe) return callback({ redirectURL: safe });
+    }
+    if (type !== 'mainFrame' && type !== 'subFrame') return callback({});
     if (url.startsWith('file:') && c.settings.allowFileUrls) return callback({});
     if (c.isServerUrl(url)) return callback({});
     const verdict = evaluateUrl(url, c.policy);
-    if (verdict.allowed) return callback({});
-    callback({ cancel: true });
-    c.onBlocked(details, verdict);
+    if (!verdict.allowed) {
+      callback({ cancel: true });
+      c.onBlocked(details, verdict);
+      return;
+    }
+    // Seat checks and shared-session cookies must be ready before the page loads.
+    const pending = type === 'mainFrame' && c.prepareNavigation(details);
+    if (!pending) return callback({});
+    pending.then(
+      (result) => callback(result && result.cancel ? { cancel: true } : {}),
+      () => callback({})
+    );
   });
+
+  // YouTube Restricted Mode is enforced with a request header (Google's documented method).
+  ses.webRequest.onBeforeSendHeaders(
+    { urls: ['*://*.youtube.com/*', '*://youtube.com/*', '*://*.youtube-nocookie.com/*', '*://youtubei.googleapis.com/*', '*://youtube.googleapis.com/*'] },
+    (details, callback) => {
+      const c = ctx();
+      const mode = c && c.settings.youtubeRestrict;
+      if (mode === 'moderate' || mode === 'strict') details.requestHeaders['YouTube-Restrict'] = mode === 'strict' ? 'Strict' : 'Moderate';
+      callback({ requestHeaders: details.requestHeaders });
+    }
+  );
 
   // Trust the pinned control-server certificate (for the admin console in a tab).
   ses.setCertificateVerifyProc((req, callback) => {
@@ -93,10 +137,10 @@ function configureSession(partition, ctx) {
     return ['clipboard-sanitized-write', 'fullscreen', 'notifications', 'pointerLock', 'clipboard-read'].includes(permission);
   });
 
-  ses.on('will-download', (event, item) => {
+  ses.on('will-download', (event, item, wc) => {
     const c = ctx();
     if (!c) return event.preventDefault();
-    c.onDownload(event, item);
+    c.onDownload(event, item, wc);
   });
 
   // Never offer to store passwords; K-Browser manages them centrally.
@@ -105,4 +149,4 @@ function configureSession(partition, ctx) {
   return ses;
 }
 
-module.exports = { configureSession, cleanUserAgent };
+module.exports = { configureSession, cleanUserAgent, safeSearchUrl };

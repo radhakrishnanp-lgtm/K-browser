@@ -1,8 +1,10 @@
 'use strict';
+const crypto = require('crypto');
 const express = require('express');
-const { requireSession, clientIp } = require('../auth');
+const { requireSession, clientIp, need } = require('../auth');
+const { can, ROLES } = require('../rbac');
 const { hashPassword, randomPassword, base32Decode } = require('../crypto');
-const { evaluateUrl } = require('../match');
+const { evaluateUrl, parseSchedule, CATEGORIES, DLP_FLAGS } = require('../match');
 const { OVERRIDABLE_SETTINGS, DEFAULT_SETTINGS } = require('../store');
 const P = require('../policy');
 
@@ -26,12 +28,22 @@ function cleanRules(rules) {
   if (!Array.isArray(rules)) return [];
   return rules
     .filter((r) => r && str(r.pattern))
-    .map((r) => ({
-      pattern: str(r.pattern, 1000),
-      action: r.action === 'allow' ? 'allow' : 'block',
-      note: str(r.note, 200),
-      enabled: r.enabled !== false,
-    }));
+    .map((r) => {
+      const schedule = str(r.schedule, 120);
+      if (schedule) {
+        try {
+          parseSchedule(schedule);
+        } catch (err) {
+          throw new BadRequest(`Rule "${str(r.pattern)}": ${err.message}`);
+        }
+      }
+      const pattern = str(r.pattern, 1000);
+      if (/^category:/i.test(pattern) && !CATEGORIES[pattern.slice(9).trim().toLowerCase()]) throw new BadRequest(`Unknown category in "${pattern}"`);
+      const out = { pattern, action: r.action === 'allow' ? 'allow' : 'block', note: str(r.note, 200), enabled: r.enabled !== false };
+      if (schedule) out.schedule = schedule;
+      if (r.expiresAt && !Number.isNaN(Date.parse(r.expiresAt))) out.expiresAt = new Date(r.expiresAt).toISOString();
+      return out;
+    });
 }
 
 function cleanPolicy(p, allowInherit) {
@@ -61,8 +73,16 @@ function cleanOverrides(s) {
 
 module.exports = function adminRoutes(ctx) {
   const { store, audit, vault, hub, info } = ctx;
+  const { seats } = ctx;
   const r = express.Router();
-  r.use(requireSession(store, { admin: true }));
+  r.use(requireSession(store, { console: true }));
+  // Every GET needs "read"; writes are guarded per route below.
+  r.use((req, res, next) => (req.method === 'GET' ? need('read')(req, res, next) : next()));
+  const CONFIG = need('config:write');
+  const CREDS = need('credentials:write');
+  const USERS = need('users:write');
+  const SESSIONS = need('sessions:write');
+  const REQUESTS = need('requests:write');
 
   const log = (req, type, detail) =>
     audit.add({ type: `admin.${type}`, userId: req.user.id, username: req.user.username, ip: clientIp(req), detail });
@@ -83,6 +103,7 @@ module.exports = function adminRoutes(ctx) {
     settings: u.settings || {},
     bookmarks: u.bookmarks || [],
     mustChangePassword: !!u.mustChangePassword,
+    twoFactor: !!u.totpEnabled,
     lastLoginAt: u.lastLoginAt || null,
     createdAt: u.createdAt,
     online: store.data.sessions.some((s) => s.userId === u.id && hub.isOnline(s.id)),
@@ -108,6 +129,15 @@ module.exports = function adminRoutes(ctx) {
     assignedUserIds: c.assignedUserIds || [],
     assignedGroupIds: c.assignedGroupIds || [],
     notes: c.notes || '',
+    plan: c.plan || '',
+    vendor: c.vendor || '',
+    seats: Number(c.seats) || 0,
+    costMonthly: Number(c.costMonthly) || 0,
+    renewalDate: c.renewalDate || '',
+    seatsInUse: seats.holders(c.id).map((h) => h.username),
+    hasSession: !!c.sessionEnc,
+    sessionCapturedAt: c.sessionCapturedAt || '',
+    sessionCapturedBy: c.sessionCapturedBy || '',
     updatedAt: c.updatedAt,
   });
 
@@ -145,6 +175,10 @@ module.exports = function adminRoutes(ctx) {
         .map(([host, visits]) => ({ host, visits })),
       recent: audit.query({ limit: 15 }),
       server: info,
+      pendingRequests: store.data.accessRequests.filter((a) => a.status === 'pending').length,
+      subscriptions: subscriptionSummary(),
+      me: { username: req.user.username, role: req.user.role, twoFactor: !!req.user.totpEnabled, perms: ROLES[req.user.role].perms },
+      settings: { requireAdmin2fa: !!store.data.settings.requireAdmin2fa, currency: store.data.settings.currency },
     });
   });
 
@@ -162,7 +196,7 @@ module.exports = function adminRoutes(ctx) {
     }
     if (body.displayName !== undefined) patch.displayName = str(body.displayName, 120);
     if (body.email !== undefined) patch.email = str(body.email, 200);
-    if (body.role !== undefined) patch.role = body.role === 'admin' ? 'admin' : 'user';
+    if (body.role !== undefined) patch.role = Object.keys(ROLES).includes(body.role) ? body.role : 'user';
     if (body.enabled !== undefined) patch.enabled = !!body.enabled;
     if (body.groupIds !== undefined) patch.groupIds = list(body.groupIds).filter((id) => store.get('groups', id));
     if (body.policy !== undefined) patch.policy = cleanPolicy(body.policy, true);
@@ -176,7 +210,15 @@ module.exports = function adminRoutes(ctx) {
     return patch;
   };
 
-  r.post('/users', (req, res) => {
+  // Only full administrators may hand out console roles.
+  const guardRole = (req, target) => {
+    const wants = (req.body || {}).role;
+    if (can(req.user, '*')) return;
+    if ((wants && wants !== 'user') || (target && target.role !== 'user')) throw new BadRequest('Only administrators can manage console accounts');
+  };
+
+  r.post('/users', USERS, (req, res) => {
+    guardRole(req, null);
     const body = req.body || {};
     const generated = body.password ? null : randomPassword(12);
     const patch = applyUser({ ...body, password: body.password || generated });
@@ -193,11 +235,12 @@ module.exports = function adminRoutes(ctx) {
     res.status(201).json({ ...userView(user), generatedPassword: generated });
   });
 
-  r.put('/users/:id', (req, res) => {
+  r.put('/users/:id', USERS, (req, res) => {
     const user = store.get('users', req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
+    guardRole(req, user);
     const patch = applyUser(req.body || {}, user);
-    if (user.id === req.user.id && (patch.role === 'user' || patch.enabled === false)) {
+    if (user.id === req.user.id && ((patch.role && patch.role !== req.user.role) || patch.enabled === false)) {
       throw new BadRequest('You cannot remove your own administrator access');
     }
     store.update('users', user.id, patch);
@@ -215,18 +258,29 @@ module.exports = function adminRoutes(ctx) {
     res.json(userView(user));
   });
 
-  r.post('/users/:id/reset-password', (req, res) => {
+  r.post('/users/:id/reset-password', USERS, (req, res) => {
     const user = store.get('users', req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
+    guardRole(req, user);
     const password = str((req.body || {}).password, 200) || randomPassword(12);
     store.update('users', user.id, { passwordHash: hashPassword(password), mustChangePassword: !!(req.body || {}).mustChangePassword });
     log(req, 'user.reset-password', user.username);
     res.json({ password });
   });
 
-  r.delete('/users/:id', (req, res) => {
+  r.post('/users/:id/reset-2fa', USERS, (req, res) => {
     const user = store.get('users', req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
+    guardRole(req, user);
+    store.update('users', user.id, { totpEnc: '', totpPendingEnc: '', totpEnabled: false });
+    log(req, 'user.reset-2fa', user.username);
+    res.json({ ok: true });
+  });
+
+  r.delete('/users/:id', USERS, (req, res) => {
+    const user = store.get('users', req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    guardRole(req, user);
     if (user.id === req.user.id) throw new BadRequest('You cannot delete yourself');
     for (const s of store.data.sessions.filter((s) => s.userId === user.id)) {
       hub.send(s.id, 'logout', { reason: 'Your account was removed' });
@@ -234,6 +288,8 @@ module.exports = function adminRoutes(ctx) {
     }
     store.data.sessions = store.data.sessions.filter((s) => s.userId !== user.id);
     for (const c of store.data.credentials) c.assignedUserIds = (c.assignedUserIds || []).filter((id) => id !== user.id);
+    for (const d of store.data.dlpRules) d.userIds = (d.userIds || []).filter((id) => id !== user.id);
+    seats.releaseUser(user.id);
     store.remove('users', user.id);
     log(req, 'user.delete', user.username);
     res.json({ ok: true });
@@ -247,6 +303,7 @@ module.exports = function adminRoutes(ctx) {
       settings: P.effectiveSettings(store, user),
       bookmarks: P.effectiveBookmarks(store, user),
       credentials: P.credentialsForUser(store, user).map((x) => P.publicCredential(x.credential, x.priority)),
+      dlp: P.dlpRulesForUser(store, user),
     });
   });
 
@@ -268,7 +325,7 @@ module.exports = function adminRoutes(ctx) {
     return patch;
   };
 
-  r.post('/groups', (req, res) => {
+  r.post('/groups', CONFIG, (req, res) => {
     const patch = applyGroup({ name: '', ...req.body });
     const group = store.insert('groups', { policy: { mode: 'inherit', rules: [] }, settings: {}, bookmarks: [], ...patch });
     if (Array.isArray(req.body.memberIds)) setMembers(group.id, req.body.memberIds);
@@ -287,7 +344,7 @@ module.exports = function adminRoutes(ctx) {
     store.save();
   };
 
-  r.put('/groups/:id', (req, res) => {
+  r.put('/groups/:id', CONFIG, (req, res) => {
     const group = store.get('groups', req.params.id);
     if (!group) return res.status(404).json({ error: 'Group not found' });
     store.update('groups', group.id, applyGroup(req.body || {}));
@@ -297,11 +354,12 @@ module.exports = function adminRoutes(ctx) {
     res.json(group);
   });
 
-  r.delete('/groups/:id', (req, res) => {
+  r.delete('/groups/:id', CONFIG, (req, res) => {
     const group = store.get('groups', req.params.id);
     if (!group) return res.status(404).json({ error: 'Group not found' });
     for (const u of store.data.users) u.groupIds = (u.groupIds || []).filter((g) => g !== group.id);
     for (const c of store.data.credentials) c.assignedGroupIds = (c.assignedGroupIds || []).filter((g) => g !== group.id);
+    for (const d of store.data.dlpRules) d.groupIds = (d.groupIds || []).filter((g) => g !== group.id);
     store.remove('groups', group.id);
     log(req, 'group.delete', group.name);
     notifyAll();
@@ -347,19 +405,27 @@ module.exports = function adminRoutes(ctx) {
     for (const [k, d] of [['autoFill', true], ['autoSubmit', false], ['showOnNewTab', true], ['everyone', false], ['enabled', true]]) {
       if (body[k] !== undefined || !existing) patch[k] = bool(body[k], existing ? existing[k] : d);
     }
+    for (const k of ['plan', 'vendor']) if (body[k] !== undefined) patch[k] = str(body[k], 120);
+    if (body.seats !== undefined) patch.seats = Math.max(0, Math.floor(Number(body.seats) || 0));
+    if (body.costMonthly !== undefined) patch.costMonthly = Math.max(0, Number(body.costMonthly) || 0);
+    if (body.renewalDate !== undefined) {
+      const d = str(body.renewalDate, 10);
+      if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) throw new BadRequest('Renewal date must be YYYY-MM-DD');
+      patch.renewalDate = d;
+    }
     if (body.assignedUserIds !== undefined) patch.assignedUserIds = list(body.assignedUserIds).filter((id) => store.get('users', id));
     if (body.assignedGroupIds !== undefined) patch.assignedGroupIds = list(body.assignedGroupIds).filter((id) => store.get('groups', id));
     return patch;
   };
 
-  r.post('/credentials', (req, res) => {
+  r.post('/credentials', CREDS, (req, res) => {
     const c = store.insert('credentials', { assignedUserIds: [], assignedGroupIds: [], ...applyCredential(req.body || {}) });
     log(req, 'credential.create', c.name);
     notifyAll();
     res.status(201).json(credView(c));
   });
 
-  r.put('/credentials/:id', (req, res) => {
+  r.put('/credentials/:id', CREDS, (req, res) => {
     const c = store.get('credentials', req.params.id);
     if (!c) return res.status(404).json({ error: 'Credential not found' });
     store.update('credentials', c.id, applyCredential(req.body || {}, c));
@@ -368,7 +434,16 @@ module.exports = function adminRoutes(ctx) {
     res.json(credView(c));
   });
 
-  r.delete('/credentials/:id', (req, res) => {
+  r.delete('/credentials/:id/session', CREDS, (req, res) => {
+    const c = store.get('credentials', req.params.id);
+    if (!c) return res.status(404).json({ error: 'Credential not found' });
+    store.update('credentials', c.id, { sessionEnc: '', sessionCapturedAt: '', sessionCapturedBy: '' });
+    log(req, 'credential.session-clear', c.name);
+    notifyAll();
+    res.json({ ok: true });
+  });
+
+  r.delete('/credentials/:id', CREDS, (req, res) => {
     const c = store.get('credentials', req.params.id);
     if (!c) return res.status(404).json({ error: 'Credential not found' });
     store.remove('credentials', c.id);
@@ -379,7 +454,7 @@ module.exports = function adminRoutes(ctx) {
 
   // ---- global policy, bookmarks, settings -------------------------------
   r.get('/policy', (req, res) => res.json(store.data.policy));
-  r.put('/policy', (req, res) => {
+  r.put('/policy', CONFIG, (req, res) => {
     store.data.policy = cleanPolicy(req.body, false);
     store.save();
     log(req, 'policy.update', `${store.data.policy.mode}, ${store.data.policy.rules.length} rules`);
@@ -387,7 +462,7 @@ module.exports = function adminRoutes(ctx) {
     res.json(store.data.policy);
   });
 
-  r.post('/policy/test', (req, res) => {
+  r.post('/policy/test', need('read'), (req, res) => {
     const { url, userId } = req.body || {};
     const user = userId ? store.get('users', userId) : null;
     const policy = user ? P.effectivePolicy(store, user) : store.data.policy;
@@ -395,7 +470,7 @@ module.exports = function adminRoutes(ctx) {
   });
 
   r.get('/bookmarks', (req, res) => res.json(store.data.bookmarks));
-  r.put('/bookmarks', (req, res) => {
+  r.put('/bookmarks', CONFIG, (req, res) => {
     store.data.bookmarks = cleanBookmarks(req.body);
     store.save();
     log(req, 'bookmarks.update', `${store.data.bookmarks.length} bookmarks`);
@@ -404,13 +479,16 @@ module.exports = function adminRoutes(ctx) {
   });
 
   r.get('/settings', (req, res) => res.json(store.data.settings));
-  r.put('/settings', (req, res) => {
+  r.put('/settings', CONFIG, (req, res) => {
     const body = req.body || {};
     const s = store.data.settings;
+    if (body.youtubeRestrict !== undefined && !['off', 'moderate', 'strict'].includes(body.youtubeRestrict)) throw new BadRequest('Invalid YouTube mode');
+    if (body.webhookUrl && !/^https?:\/\//i.test(String(body.webhookUrl))) throw new BadRequest('Webhook URL must start with https://');
     for (const [key, dflt] of Object.entries(DEFAULT_SETTINGS)) {
       if (body[key] === undefined) continue;
       if (typeof dflt === 'boolean') s[key] = !!body[key];
       else if (typeof dflt === 'number') s[key] = Math.max(0, Number(body[key]) || 0);
+      else if (key === 'webhookEvents') s[key] = list(body[key]);
       else if (Array.isArray(dflt)) s[key] = list(body[key]).map((x) => x.replace(/^\./, '').toLowerCase());
       else s[key] = str(String(body[key]), 2000);
     }
@@ -448,7 +526,7 @@ module.exports = function adminRoutes(ctx) {
     );
   });
 
-  r.post('/sessions/:id/logout', (req, res) => {
+  r.post('/sessions/:id/logout', SESSIONS, (req, res) => {
     const s = store.get('sessions', req.params.id);
     if (!s) return res.status(404).json({ error: 'Session not found' });
     hub.send(s.id, 'logout', { reason: str((req.body || {}).reason) || 'Signed out by administrator' });
@@ -460,7 +538,7 @@ module.exports = function adminRoutes(ctx) {
   });
 
   // Commands: message, open-url, close-all-tabs, refresh, clear-data
-  r.post('/command', (req, res) => {
+  r.post('/command', SESSIONS, (req, res) => {
     const { target = 'all', sessionId, userId, command, text, url, level } = req.body || {};
     const allowed = ['message', 'open-url', 'close-tabs', 'refresh', 'clear-data'];
     if (!allowed.includes(command)) throw new BadRequest('Unknown command');
@@ -494,10 +572,154 @@ module.exports = function adminRoutes(ctx) {
 
   // ---- backup ------------------------------------------------------------
   // Secrets stay encrypted in the export; it can only be restored with the same vault key.
-  r.get('/backup', (req, res) => {
+  r.get('/audit/verify', (req, res) => res.json(audit.verify()));
+
+  r.get('/backup', need('backup'), (req, res) => {
     log(req, 'backup.export', '');
     res.setHeader('Content-Disposition', `attachment; filename="kbrowser-backup-${new Date().toISOString().slice(0, 10)}.json"`);
     res.json({ ...store.data, sessions: [] });
+  });
+
+  // ---- data protection (DLP) -------------------------------------------------
+  r.get('/dlp', (req, res) => res.json(store.data.dlpRules));
+  r.put('/dlp', CONFIG, (req, res) => {
+    if (!Array.isArray(req.body)) throw new BadRequest('Expected a list of rules');
+    store.data.dlpRules = req.body
+      .filter((d) => d && list(d.match).length)
+      .map((d) => {
+        const row = {
+          id: str(d.id, 64) || crypto.randomUUID(),
+          name: str(d.name, 120) || list(d.match)[0],
+          match: list(d.match),
+          everyone: !!d.everyone,
+          groupIds: list(d.groupIds).filter((id) => store.get('groups', id)),
+          userIds: list(d.userIds).filter((id) => store.get('users', id)),
+          enabled: d.enabled !== false,
+        };
+        for (const f of DLP_FLAGS) row[f] = !!d[f];
+        return row;
+      });
+    store.save();
+    log(req, 'dlp.update', `${store.data.dlpRules.length} rules`);
+    notifyAll();
+    res.json(store.data.dlpRules);
+  });
+
+  // ---- access requests ------------------------------------------------------
+  r.get('/requests', (req, res) => {
+    const status = req.query.status;
+    res.json(store.data.accessRequests.filter((a) => !status || a.status === status).slice().reverse().slice(0, 500));
+  });
+
+  r.post('/requests/:id/:decision', REQUESTS, (req, res) => {
+    const a = store.get('accessRequests', req.params.id);
+    if (!a) return res.status(404).json({ error: 'Request not found' });
+    if (a.status !== 'pending') throw new BadRequest('This request was already handled');
+    const { decision } = req.params;
+    if (!['approve', 'deny'].includes(decision)) throw new BadRequest('Unknown decision');
+    const note = str((req.body || {}).note, 300);
+    const user = store.get('users', a.userId);
+    const patch = { status: decision === 'approve' ? 'approved' : 'denied', decidedBy: req.user.username, decidedAt: new Date().toISOString(), note };
+    if (decision === 'approve' && user) {
+      const minutes = Math.max(0, Number((req.body || {}).minutes) || 0);
+      const pattern = str((req.body || {}).pattern, 500) || a.host.replace(/^www\./, '');
+      const rule = { pattern, action: 'allow', note: `Approved by ${req.user.username}`, enabled: true };
+      if (minutes) rule.expiresAt = new Date(Date.now() + minutes * 60000).toISOString();
+      const policy = user.policy || { mode: 'inherit', rules: [] };
+      // Drop expired grants, then put the new one first so it wins.
+      policy.rules = [rule, ...(policy.rules || []).filter((x) => !x.expiresAt || Date.parse(x.expiresAt) > Date.now())];
+      store.update('users', user.id, { policy });
+      patch.expiresAt = rule.expiresAt || null;
+      patch.pattern = pattern;
+    }
+    store.update('accessRequests', a.id, patch);
+    log(req, `request.${decision}`, `${a.username} → ${a.host}${patch.expiresAt ? ` until ${patch.expiresAt}` : ''}`);
+    if (user) {
+      const text =
+        decision === 'approve'
+          ? `Your request for ${a.host} was approved${patch.expiresAt ? ` until ${new Date(patch.expiresAt).toLocaleString()}` : ''}.`
+          : `Your request for ${a.host} was declined.${note ? ' ' + note : ''}`;
+      hub.sendToUser(user.id, 'refresh', {});
+      hub.sendToUser(user.id, 'message', { text, level: decision === 'approve' ? 'info' : 'warning', from: req.user.displayName || req.user.username });
+    }
+    res.json(store.get('accessRequests', a.id));
+  });
+
+  // ---- subscriptions / licence overview --------------------------------------
+  function subscriptionSummary() {
+    const soon = Date.now() + 30 * 24 * 3600 * 1000;
+    const creds = store.data.credentials;
+    return {
+      monthlyCost: creds.reduce((n, c) => n + (Number(c.costMonthly) || 0), 0),
+      renewalsSoon: creds.filter((c) => c.renewalDate && Date.parse(c.renewalDate) <= soon).map((c) => ({ id: c.id, name: c.name, renewalDate: c.renewalDate })),
+      seatsInUse: creds.reduce((n, c) => n + seats.holders(c.id).length, 0),
+    };
+  }
+
+  r.get('/subscriptions', (req, res) => {
+    const userCount = (c) => {
+      if (c.everyone) return store.data.users.filter((u) => u.enabled !== false).length;
+      const ids = new Set(c.assignedUserIds || []);
+      for (const u of store.data.users) if ((u.groupIds || []).some((g) => (c.assignedGroupIds || []).includes(g))) ids.add(u.id);
+      return ids.size;
+    };
+    const since = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+    const fills = audit.query({ type: 'credential.fill,session.use', since, limit: 100000 });
+    res.json({
+      currency: store.data.settings.currency,
+      ...subscriptionSummary(),
+      items: store.data.credentials.map((c) => ({
+        ...credView(c),
+        eligibleUsers: userCount(c),
+        uses30d: fills.filter((e) => e.detail === c.name).length,
+        activeUsers30d: new Set(fills.filter((e) => e.detail === c.name).map((e) => e.userId)).size,
+      })),
+    });
+  });
+
+  // ---- productivity reports ---------------------------------------------------
+  function usageRows(q) {
+    const from = q.from || new Date(Date.now() - 6 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    const to = q.to || new Date().toISOString().slice(0, 10);
+    const totals = new Map();
+    for (const [day, users] of Object.entries(store.data.usage || {})) {
+      if (day < from || day > to) continue;
+      for (const [userId, hosts] of Object.entries(users)) {
+        if (q.userId && userId !== q.userId) continue;
+        for (const [host, secs] of Object.entries(hosts)) {
+          const key = q.groupBy === 'host' ? host : `${userId}|${host}`;
+          const row = totals.get(key) || { userId: q.groupBy === 'host' ? null : userId, host, seconds: 0 };
+          row.seconds += secs;
+          totals.set(key, row);
+        }
+      }
+    }
+    const names = new Map(store.data.users.map((u) => [u.id, u.username]));
+    return { from, to, rows: [...totals.values()].map((r) => ({ ...r, username: r.userId ? names.get(r.userId) || '(deleted)' : '' })).sort((a, b) => b.seconds - a.seconds) };
+  }
+
+  r.get('/reports/usage', (req, res) => res.json(usageRows(req.query)));
+  r.get('/reports/usage.csv', (req, res) => {
+    const { rows } = usageRows(req.query);
+    const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="kbrowser-usage.csv"');
+    res.send(['user,site,minutes', ...rows.map((r) => [r.username, r.host, Math.round(r.seconds / 60)].map(esc).join(','))].join('\n'));
+  });
+
+  r.get('/categories', (req, res) => res.json(Object.entries(CATEGORIES).map(([key, c]) => ({ key, label: c.label, count: c.domains.length, examples: c.domains.slice(0, 6) }))));
+  r.get('/roles', (req, res) => res.json(Object.entries(ROLES).map(([key, r2]) => ({ key, label: r2.label }))));
+
+  r.post('/settings/test-webhook', CONFIG, async (req, res) => {
+    const url = store.data.settings.webhookUrl;
+    if (!url) return res.status(400).json({ error: 'Save a webhook URL first' });
+    try {
+      const text = `[${store.data.settings.orgName}] ✅ K-Browser alert test from ${req.user.username}`;
+      const r2 = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, content: text }), signal: AbortSignal.timeout(8000) });
+      res.json({ ok: r2.ok, status: r2.status });
+    } catch (err) {
+      res.json({ ok: false, error: err.message });
+    }
   });
 
   r.use((err, req, res, next) => {

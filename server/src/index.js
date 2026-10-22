@@ -10,6 +10,7 @@ const { Hub } = require('./hub');
 const { createApp } = require('./app');
 const { loadOrCreateCert, lanAddresses } = require('./tls');
 const { startDiscovery } = require('./discovery');
+const { attachAlerts } = require('./alerts');
 const pkg = require('../package.json');
 
 const dataDir = path.resolve(process.env.KB_DATA_DIR || path.join(__dirname, '..', 'data'));
@@ -69,6 +70,19 @@ async function main() {
   const hub = new Hub();
   const info = { version: pkg.version, fingerprint: tls.fingerprint, port, hostname: os.hostname(), addresses: lanAddresses() };
   const app = createApp({ store, audit, vault, hub, info });
+  attachAlerts(audit, store);
+
+  // Daily housekeeping: drop old usage statistics and finished access requests.
+  const housekeeping = () => {
+    const keepDays = Number(store.data.settings.usageRetentionDays) || 90;
+    const cutoff = new Date(Date.now() - keepDays * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    for (const day of Object.keys(store.data.usage || {})) if (day < cutoff) delete store.data.usage[day];
+    const old = new Date(Date.now() - 180 * 24 * 3600 * 1000).toISOString();
+    store.data.accessRequests = store.data.accessRequests.filter((a) => a.status === 'pending' || a.createdAt > old);
+    store.save();
+  };
+  housekeeping();
+  setInterval(housekeeping, 6 * 3600 * 1000).unref();
 
   const firstPassword = ensureAdmin(store);
   if (firstPassword) {

@@ -1,6 +1,6 @@
 {
   "name": "kbrowser-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "K-Browser Control Server: central admin, credential vault and web filtering for K-Browser clients on your LAN",
   "main": "src/index.js",
   "bin": {

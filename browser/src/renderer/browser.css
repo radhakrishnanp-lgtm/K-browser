@@ -63,3 +63,4 @@ button.icon:not(:disabled):hover, .user:hover, .chip:hover { background: var(--h
 #findbar input, #pwform input { border: 1px solid var(--border); background: var(--input); color: inherit; border-radius: 6px; padding: 5px 8px; font: inherit; width: 240px; user-select: text; }
 #pwform button { border: 1px solid var(--border); padding: 4px 10px; }
 #find-count { color: var(--muted); min-width: 60px; }
+.chip.shield { background: color-mix(in srgb, #12925a 16%, transparent); color: #12925a; cursor: default; }

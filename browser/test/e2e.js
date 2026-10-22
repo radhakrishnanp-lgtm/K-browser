@@ -64,6 +64,16 @@ const LOGIN_PAGE = `<!doctype html><html><head><title>Fake SaaS login</title></h
 
 function startSite() {
   const server = http.createServer((req, res) => {
+    if (req.url.startsWith('/whoami')) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`<!doctype html><title>whoami</title><pre id="cookies">${(req.headers.cookie || '').replace(/[<>&]/g, '')}</pre>`);
+      return;
+    }
+    if (req.url.startsWith('/copy')) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<!doctype html><title>Confidential CRM</title><p id="secret">Customer list: ACME, Globex</p><input id="box">');
+      return;
+    }
     if (req.method === 'POST' && req.url === '/session') {
       let body = '';
       req.on('data', (c) => (body += c));
@@ -116,6 +126,12 @@ async function startServer() {
 }
 
 async function main() {
+  const { safeSearchUrl } = require('../src/main/session');
+  assert.strictEqual(safeSearchUrl('https://www.google.com/search?q=cats'), 'https://www.google.com/search?q=cats&safe=active');
+  assert.strictEqual(safeSearchUrl('https://www.google.co.in/search?q=x&safe=active'), null);
+  assert.ok(safeSearchUrl('https://www.bing.com/search?q=x').includes('adlt=strict'));
+  assert.strictEqual(safeSearchUrl('https://example.com/search?q=x'), null);
+  console.log('✔ SafeSearch rewriting');
   const site = await startSite();
   const serverProc = await startServer();
   let app;
@@ -126,6 +142,17 @@ async function main() {
     await api('POST', '/admin/credentials', { name: 'FakeSaaS (manual)', match: [`127.0.0.2:${SITE_PORT}`], loginUrl: `http://127.0.0.2:${SITE_PORT}/login`, username: 'manual@office.com', password: 'S3cret-SaaS!', autoSubmit: false, assignedUserIds: [staff.id] }, admin);
     await api('PUT', '/admin/policy', { mode: 'blocklist', rules: [{ pattern: 'localhost', action: 'block', note: 'test' }] }, admin);
     await api('PUT', '/admin/bookmarks', [{ title: 'FakeSaaS', url: `http://127.0.0.1:${SITE_PORT}/login` }], admin);
+    const arun = await api('POST', '/admin/users', { username: 'arun', password: 'arun-pass-1' }, admin);
+    // One-seat licence, currently held by Arun
+    const seatCred = await api('POST', '/admin/credentials', { name: 'One-seat tool', match: [`127.0.0.3:${SITE_PORT}`], username: 'x', password: 'y', seats: 1, assignedUserIds: [staff.id, arun.id] }, admin);
+    const arunTok = (await api('POST', '/auth/login', { username: 'arun', password: 'arun-pass-1' })).token;
+    await api('POST', '/client/seat', { credentialId: seatCred.id, url: `http://127.0.0.3:${SITE_PORT}/` }, arunTok);
+    // Shared signed-in session captured by the administrator
+    const sessCred = await api('POST', '/admin/credentials', { name: 'Shared session site', match: [`127.0.0.4:${SITE_PORT}`], assignedUserIds: [staff.id] }, admin);
+    const adminBrowser = (await api('POST', '/auth/login', { username: 'admin', password: ADMIN_PW })).token;
+    await api('POST', '/client/capture-session', { credentialId: sessCred.id, url: `http://127.0.0.4:${SITE_PORT}/`, cookies: [{ name: 'kbsid', value: 'shared-123', domain: '127.0.0.4', path: '/', secure: false, httpOnly: true, sameSite: 'lax' }] }, adminBrowser);
+    // Data protection on the "CRM" page
+    await api('PUT', '/admin/dlp', [{ name: 'CRM', match: [`127.0.0.2:${SITE_PORT}/copy`], blockCopy: true, blockPaste: true, watermark: true, everyone: true }], admin);
 
     const managed = path.join(tmp, 'managed.json');
     fs.writeFileSync(managed, JSON.stringify({ serverUrl: `https://127.0.0.1:${PORT}`, fingerprint, lockServer: true }));
@@ -202,6 +229,63 @@ async function main() {
     screenshot('05-message');
     console.log('✔ admin message appears instantly');
 
+    // 5b. Seat limit: Arun holds the only seat
+    await shell.fill('#address', `http://127.0.0.3:${SITE_PORT}/`);
+    await shell.press('#address', 'Enter');
+    const seatPage = await page((u) => u.startsWith('kb://blocked') && u.includes('reason=seats'), 'seat limit page');
+    await seatPage.waitForSelector('#title');
+    assert.strictEqual(await seatPage.textContent('#title'), 'All seats are in use');
+    assert.ok((await seatPage.textContent('#text')).includes('arun'));
+    console.log('✔ seat limit stops a second user while the licence is in use');
+
+    // 5c. Shared session: cookies captured by the admin are used without any password
+    await shell.fill('#address', `http://127.0.0.4:${SITE_PORT}/whoami`);
+    await shell.press('#address', 'Enter');
+    const who = await page((u) => u === `http://127.0.0.4:${SITE_PORT}/whoami`, 'shared session page');
+    await who.waitForSelector('#cookies');
+    assert.ok((await who.textContent('#cookies')).includes('kbsid=shared-123'));
+    console.log('✔ administrator’s shared session signs staff in without a password');
+
+    // 5d. Data protection: copy blocked, watermark shown, shield in toolbar
+    await shell.fill('#address', `http://127.0.0.2:${SITE_PORT}/copy`);
+    await shell.press('#address', 'Enter');
+    const crm = await page((u) => u === `http://127.0.0.2:${SITE_PORT}/copy`, 'CRM page');
+    await crm.waitForSelector('#secret');
+    await waitFor(async () => !(await shell.isHidden('#shield')), { label: 'protected chip' });
+    const copied = await crm.evaluate(() => {
+      let fired = false;
+      document.addEventListener('copy', () => (fired = true));
+      const r = document.createRange();
+      r.selectNodeContents(document.getElementById('secret'));
+      getSelection().removeAllRanges();
+      getSelection().addRange(r);
+      document.execCommand('copy');
+      return fired;
+    });
+    assert.strictEqual(copied, false, 'copy event never reaches the page');
+    const marks = await crm.evaluate(() => [...document.documentElement.children].filter((e) => e.tagName === 'DIV').length);
+    assert.ok(marks >= 1, 'watermark overlay present');
+    await sleep(500);
+    screenshot('06-dlp-watermark');
+    console.log('✔ data protection: copy blocked, watermark and "Protected" badge shown');
+
+    // 5e. Access request from the block page, approved by the admin
+    await shell.fill('#address', `http://localhost:${SITE_PORT}/whoami`);
+    await shell.press('#address', 'Enter');
+    const bp = await page((u) => u.startsWith('kb://blocked') && u.includes('localhost'), 'blocked page for request');
+    await bp.waitForSelector('#reason');
+    await bp.fill('#reason', 'Need the internal tool for a client demo');
+    await bp.click('#request');
+    await bp.waitForSelector('#sent:not([hidden])');
+    const pending = await waitFor(async () => (await api('GET', '/admin/requests?status=pending', null, admin))[0], { label: 'pending request' });
+    assert.strictEqual(pending.reason, 'Need the internal tool for a client demo');
+    await api('POST', `/admin/requests/${pending.id}/approve`, { minutes: 30 }, admin);
+    await waitFor(async () => (await shell.textContent('#notices')).includes('approved'), { label: 'approval notice' });
+    await shell.fill('#address', `http://localhost:${SITE_PORT}/whoami`);
+    await shell.press('#address', 'Enter');
+    await page((u) => u === `http://localhost:${SITE_PORT}/whoami`, 'approved site opens');
+    console.log('✔ access request → admin approval → site opens (time-limited)');
+
     // 6. Policy change applies without restart
     await api('PUT', '/admin/policy', { mode: 'allowlist', rules: [{ pattern: `127.0.0.2:${SITE_PORT}`, action: 'allow' }] }, admin);
     await sleep(1000);
@@ -214,7 +298,10 @@ async function main() {
     await sleep(16000); // activity is flushed every 15s
     const audit = await api('GET', '/admin/audit?limit=200', null, admin);
     const types = new Set(audit.map((e) => e.type));
-    for (const t of ['login', 'credential.fill', 'blocked', 'visit']) assert.ok(types.has(t), `audit has ${t}`);
+    for (const t of ['login', 'credential.fill', 'blocked', 'visit', 'seat.denied', 'session.use', 'access.request', 'dlp.blocked']) assert.ok(types.has(t), `audit has ${t}`);
+    const usage = await api('GET', '/admin/reports/usage', null, admin);
+    assert.ok(usage.rows.some((r) => r.username === 'priya'), 'usage report has priya');
+    assert.strictEqual((await api('GET', '/admin/audit/verify', null, admin)).ok, true);
     const sessions = await api('GET', '/admin/sessions', null, admin);
     const s = sessions.find((x) => x.username === 'priya' && x.online);
     assert.ok(s, 'live session listed');

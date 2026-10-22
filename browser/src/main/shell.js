@@ -1,13 +1,36 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { app, BrowserWindow, WebContentsView, Menu, clipboard, shell: osShell, Notification, webFrameMain } = require('electron');
+const os = require('os');
+const { app, BrowserWindow, WebContentsView, Menu, clipboard, shell: osShell, Notification, webFrameMain, powerMonitor } = require('electron');
 const { configureSession } = require('./session');
-const { credentialMatches, evaluateUrl } = require('./match');
+const { credentialMatches, evaluateUrl, dlpFor } = require('./match');
 const { buildFillScript } = require('./autofill');
+const { buildDlpScript, PRINT_BLOCK_SCRIPT } = require('./dlp');
 
 const RENDERER = path.join(__dirname, '..', 'renderer');
 const ISOLATED_WORLD = 1001;
+const DLP_WORLD = 1002;
+const DLP_LABELS = {
+  blockCopy: 'copy blocked',
+  blockPaste: 'paste blocked',
+  blockPrint: 'printing blocked',
+  blockDownload: 'downloads blocked',
+  blockUpload: 'uploads blocked',
+  watermark: 'watermarked',
+  screenshotProtect: 'screenshots blocked',
+};
+
+// Registrable part of a host name, e.g. app.canva.com -> canva.com, a.b.co.in -> b.co.in
+function baseDomain(host) {
+  if (/^[\d.]+$/.test(host) || !host.includes('.')) return host;
+  const parts = host.split('.');
+  const sld = parts[parts.length - 2];
+  if (parts.length > 2 && parts[parts.length - 1].length === 2 && ['co', 'com', 'org', 'net', 'gov', 'ac', 'edu', 'ne', 'or', 'nic'].includes(sld)) {
+    return parts.slice(-3).join('.');
+  }
+  return parts.slice(-2).join('.');
+}
 const contexts = new Map(); // partition -> live policy context for session handlers
 
 function hostOf(url) {
@@ -43,6 +66,10 @@ class Shell {
     this.secretCache = new Map();
     this.autoSubmits = new Map();
     this.preferred = new Map();
+    this.importedSessions = new Map(); // credentialId -> session version already in the cookie jar
+    this.seatOk = new Map(); // credentialId -> time of last successful seat check
+    this.usage = {}; // host -> active seconds since last report
+    this.dlpReports = new Map();
     this.closed = false;
     this.partition = `persist:kb-${boot.user.id}`;
 
@@ -84,6 +111,7 @@ class Shell {
 
     this.activityTimer = setInterval(() => this.flushActivity(), 15000);
     this.idleTimer = setInterval(() => this.checkIdle(), 30000);
+    this.usageTimer = setInterval(() => this.trackUsage(), 5000);
   }
 
   get settings() {
@@ -106,7 +134,8 @@ class Shell {
       },
       onBlocked: (details, verdict) => this.onBlocked(details, verdict),
       onDownload: (event, item, wc) => this.onDownload(event, item, wc),
-      onAccessRequest: (url, reason) => this.logActivity({ type: 'access.request', url, detail: reason || 'Requested access to a blocked site' }),
+      onAccessRequest: (url, reason) => this.requestAccess(url, reason),
+      prepareNavigation: (details) => this.prepareNavigation(details),
       pageData: (page) => this.pageData(page),
     };
   }
@@ -123,7 +152,10 @@ class Shell {
       const ctx = contexts.get(this.partition);
       if (/^https?:/.test(url) && !ctx.isServerUrl(url) && !evaluateUrl(url, boot.policy).allowed) tab.view.webContents.reload();
       this.refreshMatches(tab);
+      const before = JSON.stringify(tab.dlp || {});
+      if (JSON.stringify(dlpFor(url, boot.dlp)) !== before) this.applyDlp(tab, tab.view.webContents.mainFrame);
     }
+    this.updateContentProtection();
     this.pushTabs();
   }
 
@@ -168,6 +200,7 @@ class Shell {
             secure: t.url.startsWith('https:'),
             logins: t.matches.map((c) => ({ id: c.id, name: c.name })),
             filled: !!t.filledCredId,
+            protections: Object.keys(t.dlp || {}).map((k) => DLP_LABELS[k]).filter(Boolean),
             zoom: Math.round(wc.getZoomFactor() * 100),
           };
         }),
@@ -210,7 +243,7 @@ class Shell {
     });
     view.setBackgroundColor('#ffffff');
     const id = this.nextId++;
-    const tab = { id, view, title: '', url: '', favicon: '', loading: false, matches: [], filledCredId: null };
+    const tab = { id, view, title: '', url: '', favicon: '', loading: false, matches: [], filledCredId: null, dlp: {} };
     this.tabs.set(id, tab);
     const idx = this.activeId ? this.order.indexOf(this.activeId) + 1 : this.order.length;
     this.order.splice(idx, 0, id);
@@ -230,6 +263,7 @@ class Shell {
     this.activeId = id;
     for (const t of this.tabs.values()) t.view.setVisible(t.id === id);
     this.layout();
+    this.updateContentProtection();
     if (tab.url && tab.url !== 'kb://newtab/') tab.view.webContents.focus();
     else this.send('focus-address');
     this.pushTabs();
@@ -318,6 +352,8 @@ class Shell {
       tab.url = url;
       tab.favicon = '';
       tab.filledCredId = null;
+      tab.dlp = dlpFor(url, this.boot.dlp);
+      this.updateContentProtection();
       this.refreshMatches(tab);
       if (/^https?:/.test(url)) this.logActivity({ type: 'visit', url, title: '', tabId: tab.id });
       this.pushTabs();
@@ -331,7 +367,14 @@ class Shell {
     });
     wc.on('did-frame-finish-load', (e, isMainFrame, frameProcessId, frameRoutingId) => {
       const frame = isMainFrame ? wc.mainFrame : webFrameMain.fromId(frameProcessId, frameRoutingId);
-      if (frame) this.maybeAutofill(tab, frame);
+      if (!frame) return;
+      this.applyDlp(tab, frame);
+      this.maybeAutofill(tab, frame);
+    });
+    // DLP scripts report blocked attempts with a console marker.
+    wc.on('console-message', (e, level, message) => {
+      const text = typeof message === 'string' ? message : e.message;
+      if (typeof text === 'string' && text.startsWith('__kbdlp:')) this.onDlpEvent(tab, text.slice(8));
     });
     wc.on('did-fail-load', (e, code, desc, url, isMainFrame) => {
       if (!isMainFrame || code === -3 || code === -20 || code === -27) return;
@@ -366,12 +409,18 @@ class Shell {
   wirePopup(win) {
     const wc = win.webContents;
     win.setMenuBarVisibility(false);
-    const pseudoTab = { id: -1, view: { webContents: wc }, url: '', matches: [], filledCredId: null };
+    const pseudoTab = { id: -1, view: { webContents: wc }, url: '', matches: [], filledCredId: null, dlp: {} };
     wc.on('did-frame-finish-load', (e, isMainFrame, pid, rid) => {
       pseudoTab.url = wc.getURL();
       this.refreshMatches(pseudoTab);
       const frame = isMainFrame ? wc.mainFrame : webFrameMain.fromId(pid, rid);
-      if (frame) this.maybeAutofill(pseudoTab, frame);
+      if (!frame) return;
+      this.applyDlp(pseudoTab, frame);
+      this.maybeAutofill(pseudoTab, frame);
+    });
+    wc.on('console-message', (e, level, message) => {
+      const text = typeof message === 'string' ? message : e.message;
+      if (typeof text === 'string' && text.startsWith('__kbdlp:')) this.onDlpEvent(pseudoTab, text.slice(8));
     });
     wc.on('context-menu', (e, params) => this.contextMenu(pseudoTab, params));
     wc.on('before-input-event', (e, input) => {
@@ -477,8 +526,15 @@ class Shell {
     setImmediate(() => !wc.isDestroyed() && wc.loadURL(target).catch(() => {}));
   }
 
-  onDownload(event, item) {
+  onDownload(event, item, wc) {
     const filename = item.getFilename();
+    const pageUrl = wc && !wc.isDestroyed() ? wc.getURL() : '';
+    if (dlpFor(pageUrl, this.boot.dlp).blockDownload || dlpFor(item.getURL(), this.boot.dlp).blockDownload) {
+      event.preventDefault();
+      this.logActivity({ type: 'dlp.blocked', url: pageUrl || item.getURL(), detail: `download blocked: ${filename}` });
+      this.notify({ level: 'warning', text: 'Downloading from this site is disabled by your administrator.' });
+      return;
+    }
     const ext = path.extname(filename).slice(1).toLowerCase();
     const blockedExt = (this.settings.blockedDownloadExtensions || []).map((x) => String(x).toLowerCase());
     if (!this.settings.allowDownloads || (ext && blockedExt.includes(ext))) {
@@ -564,6 +620,14 @@ class Shell {
     if (this.flushing || this.closed) return;
     this.flushing = true;
     const events = this.activity.splice(0, 200).map((e) => ({ type: e.type, url: e.url, title: e.title, detail: e.detail }));
+    const usage = this.usage;
+    this.usage = {};
+    // Seat-limited logins that are open in a tab keep their seat.
+    const activeCredentials = new Set();
+    for (const t of this.tabs.values()) {
+      const u = t.view.webContents.getURL();
+      for (const c of this.boot.credentials || []) if (c.seats && credentialMatches(u, c)) activeCredentials.add(c.id);
+    }
     const tab = this.activeTab();
     const current = {
       url: tab ? tab.view.webContents.getURL() : '',
@@ -573,9 +637,10 @@ class Shell {
       platform: `${process.platform}-${process.arch}`,
     };
     try {
-      await this.client.request('POST', '/api/client/activity', { events, current });
+      await this.client.request('POST', '/api/client/activity', { events, current, usage, activeCredentials: [...activeCredentials] });
     } catch {
       this.activity.unshift(...events);
+      for (const [h, n] of Object.entries(usage)) this.usage[h] = (this.usage[h] || 0) + n;
     } finally {
       this.flushing = false;
     }
@@ -584,9 +649,192 @@ class Shell {
   checkIdle() {
     const minutes = Number(this.settings.idleLogoutMinutes) || 0;
     if (!minutes) return;
-    const { powerMonitor } = require('electron');
     if (powerMonitor.getSystemIdleTime() >= minutes * 60) {
       this.controller.logout(`You were signed out after ${minutes} minutes of inactivity.`);
+    }
+  }
+
+  // Counts active (focused, not idle) seconds per site for productivity reports.
+  trackUsage() {
+    if (this.closed || this.win.isDestroyed() || !this.win.isFocused()) return;
+    if (powerMonitor.getSystemIdleTime() >= 60) return;
+    const t = this.activeTab();
+    const url = t ? t.view.webContents.getURL() : '';
+    if (!/^https?:/.test(url)) return;
+    const host = hostOf(url);
+    this.usage[host] = (this.usage[host] || 0) + 5;
+  }
+
+  // ---- data protection --------------------------------------------------------------
+  watermarkText() {
+    const u = this.boot.user;
+    const stamp = new Date().toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    return `${u.displayName} (${u.username}) · ${os.hostname()} · ${stamp}`;
+  }
+
+  applyDlp(tab, frame) {
+    let url;
+    try {
+      url = frame.url;
+    } catch {
+      return;
+    }
+    const wc = tab.view.webContents;
+    const flags = dlpFor(url, this.boot.dlp);
+    if (frame === wc.mainFrame) tab.dlp = flags;
+    const pageFlags = { ...flags, watermarkText: this.watermarkText() };
+    const inPage = flags.blockCopy || flags.blockPaste || flags.blockUpload || flags.watermark;
+    // Sub-frames never get their own watermark; the top frame covers the page.
+    if (frame !== wc.mainFrame) pageFlags.watermark = false;
+    const run = async () => {
+      if (inPage || (frame === wc.mainFrame && wc.__kbHadDlp)) {
+        const script = buildDlpScript(pageFlags);
+        if (frame === wc.mainFrame) await wc.executeJavaScriptInIsolatedWorld(DLP_WORLD, [{ code: script }], false);
+        else await frame.executeJavaScript(script, false);
+      }
+      if (flags.blockPrint) await frame.executeJavaScript(PRINT_BLOCK_SCRIPT, false);
+    };
+    if (frame === wc.mainFrame) wc.__kbHadDlp = !!inPage;
+    run().catch(() => {});
+    if (tab.id !== -1) {
+      this.updateContentProtection();
+      this.pushTabs();
+    }
+  }
+
+  // Hides the window from screenshots / screen sharing while a protected site is shown (Windows & macOS).
+  updateContentProtection() {
+    if (this.closed || this.win.isDestroyed()) return;
+    const t = this.activeTab();
+    const on = !!(t && t.dlp && t.dlp.screenshotProtect);
+    if (on !== this.contentProtected) {
+      this.contentProtected = on;
+      this.win.setContentProtection(on);
+    }
+  }
+
+  onDlpEvent(tab, what) {
+    const url = tab.view.webContents.getURL();
+    const key = `${what}|${url}`;
+    const last = this.dlpReports.get(key) || 0;
+    if (Date.now() - last < 30000) return;
+    this.dlpReports.set(key, Date.now());
+    this.logActivity({ type: 'dlp.blocked', url, detail: `${what} blocked` });
+    if (what === 'print') this.notify({ level: 'warning', text: 'Printing this site is disabled by your administrator.' });
+  }
+
+  // ---- shared sessions & seat limits ----------------------------------------------
+  // Runs before a top-level navigation. Returns null (nothing to do) or a promise.
+  prepareNavigation(details) {
+    const url = details.url;
+    const creds = (this.boot.credentials || []).filter((c) => (c.seats || c.hasSession) && credentialMatches(url, c));
+    if (!creds.length) return null;
+    const cred = this.chooseCredential({ matches: creds }, url);
+    const needSeat = cred.seats && Date.now() - (this.seatOk.get(cred.id) || 0) > 60000;
+    const needSession = cred.hasSession && this.importedSessions.get(cred.id) !== cred.sessionVersion;
+    if (!needSeat && !needSession) return null;
+    return (async () => {
+      if (needSeat) {
+        try {
+          await this.client.request('POST', '/api/client/seat', { credentialId: cred.id, url });
+          this.seatOk.set(cred.id, Date.now());
+        } catch (err) {
+          if (err.status === 409) {
+            const who = err.body && err.body.holders && err.body.holders.length ? ` (in use by ${err.body.holders.join(', ')})` : '';
+            const wc = details.webContents;
+            const target = `kb://blocked/?reason=seats&url=${encodeURIComponent(url)}&msg=${encodeURIComponent(err.message + who + '. Please try again later.')}`;
+            if (wc && !wc.isDestroyed()) setImmediate(() => wc.loadURL(target).catch(() => {}));
+            return { cancel: true };
+          }
+        }
+      }
+      if (needSession) {
+        try {
+          const res = await this.client.request('POST', '/api/client/session', { credentialId: cred.id, url });
+          await this.importCookies(res.cookies || []);
+          this.importedSessions.set(cred.id, cred.sessionVersion);
+        } catch (err) {
+          console.error('shared session import failed:', err.message);
+        }
+      }
+      return null;
+    })();
+  }
+
+  async importCookies(list) {
+    for (const c of list) {
+      const host = c.domain.replace(/^\./, '');
+      const cookie = {
+        url: `${c.secure ? 'https' : 'http'}://${host}${c.path || '/'}`,
+        name: c.name,
+        value: c.value,
+        path: c.path || '/',
+        secure: !!c.secure,
+        httpOnly: !!c.httpOnly,
+        sameSite: c.sameSite || 'unspecified',
+      };
+      if (c.domain.startsWith('.')) cookie.domain = c.domain;
+      if (c.expirationDate) cookie.expirationDate = c.expirationDate;
+      if (cookie.sameSite === 'no_restriction' && !cookie.secure) cookie.sameSite = 'lax';
+      await this.ses.cookies.set(cookie).catch((err) => console.error(`cookie ${c.name}:`, err.message));
+    }
+  }
+
+  // Administrator: share the sign-in of the current site with staff.
+  async shareSessionMenu() {
+    const t = this.activeTab();
+    const url = t ? t.view.webContents.getURL() : '';
+    if (!/^https?:/.test(url)) return this.notify({ level: 'warning', text: 'Open the website you are signed in to first.' });
+    let existing = [];
+    try {
+      existing = await this.client.request('GET', `/api/client/admin/credentials?url=${encodeURIComponent(url)}`);
+    } catch (err) {
+      return this.notify({ level: 'warning', text: err.message });
+    }
+    const host = hostOf(url);
+    const items = existing.map((c) => ({ label: `${c.hasSession ? 'Update' : 'Add'} shared sign-in for "${c.name}"`, click: () => this.captureSession(url, c.id, c.name) }));
+    if (items.length) items.push({ type: 'separator' });
+    items.push({ label: `Create new site login for ${host}`, click: () => this.captureSession(url, null, (t && t.title) || host) });
+    Menu.buildFromTemplate([{ label: 'Share this sign-in with staff', enabled: false }, { type: 'separator' }, ...items]).popup({ window: this.win });
+  }
+
+  async captureSession(url, credentialId, name) {
+    const host = hostOf(url);
+    const base = baseDomain(host);
+    const all = await this.ses.cookies.get({});
+    const cookies = all
+      .filter((c) => {
+        const d = c.domain.replace(/^\./, '');
+        return d === base || d.endsWith('.' + base);
+      })
+      .map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.hostOnly ? c.domain.replace(/^\./, '') : c.domain.startsWith('.') ? c.domain : '.' + c.domain,
+        path: c.path,
+        secure: c.secure,
+        httpOnly: c.httpOnly,
+        sameSite: c.sameSite,
+        expirationDate: c.expirationDate,
+      }));
+    try {
+      const res = await this.client.request('POST', '/api/client/capture-session', { credentialId, name, url, cookies });
+      this.notify({
+        level: 'info',
+        text: `Shared your ${base} sign-in (${res.cookies} cookies) as "${res.name}". ${res.created ? 'Assign it to staff in the Admin Console → Site logins.' : 'Staff will use it on their next visit.'}`,
+        sticky: true,
+      });
+    } catch (err) {
+      this.notify({ level: 'warning', text: err.message });
+    }
+  }
+
+  async requestAccess(url, reason) {
+    try {
+      await this.client.request('POST', '/api/client/access-request', { url, reason });
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -672,6 +920,7 @@ class Shell {
     const t = this.activeTab();
     if (!t) return;
     if (!this.settings.allowPrinting) return this.notify({ level: 'warning', text: 'Printing is disabled by your administrator.' });
+    if (t.dlp && t.dlp.blockPrint) return this.onDlpEvent(t, 'print');
     t.view.webContents.print();
   }
 
@@ -697,33 +946,34 @@ class Shell {
     if (p.linkURL) {
       items.push(
         { label: 'Open link in new tab', click: () => this.newTab(p.linkURL, { active: false }) },
-        { label: 'Copy link address', click: () => clipboard.writeText(p.linkURL) },
+        { label: 'Copy link address', enabled: !dlp.blockCopy, click: () => clipboard.writeText(p.linkURL) },
         { type: 'separator' }
       );
     }
     if (p.mediaType === 'image' && p.srcURL) {
       items.push(
         { label: 'Open image in new tab', click: () => this.newTab(p.srcURL, { active: false }) },
-        { label: 'Copy image', click: () => wc.copyImageAt(p.x, p.y) },
-        { label: 'Copy image address', click: () => clipboard.writeText(p.srcURL) },
+        { label: 'Copy image', enabled: !dlp.blockCopy, click: () => wc.copyImageAt(p.x, p.y) },
+        { label: 'Copy image address', enabled: !dlp.blockCopy, click: () => clipboard.writeText(p.srcURL) },
         { type: 'separator' }
       );
     }
     const isPassword = p.inputFieldType === 'password' || p.formControlType === 'input-password';
+    const dlp = tab.dlp || {};
     if (p.isEditable) {
       items.push(
         { label: 'Undo', role: 'undo', enabled: p.editFlags.canUndo },
         { label: 'Redo', role: 'redo', enabled: p.editFlags.canRedo },
         { type: 'separator' },
-        { label: 'Cut', role: 'cut', enabled: p.editFlags.canCut && !isPassword },
-        { label: 'Copy', role: 'copy', enabled: p.editFlags.canCopy && !isPassword },
-        { label: 'Paste', role: 'paste', enabled: p.editFlags.canPaste },
+        { label: 'Cut', role: 'cut', enabled: p.editFlags.canCut && !isPassword && !dlp.blockCopy },
+        { label: 'Copy', role: 'copy', enabled: p.editFlags.canCopy && !isPassword && !dlp.blockCopy },
+        { label: 'Paste', role: 'paste', enabled: p.editFlags.canPaste && !dlp.blockPaste },
         { label: 'Select all', role: 'selectAll' }
       );
     } else if (p.selectionText) {
       const sel = p.selectionText.trim().slice(0, 60);
       items.push(
-        { label: 'Copy', role: 'copy' },
+        { label: 'Copy', role: 'copy', enabled: !dlp.blockCopy },
         { label: `Search for "${sel}${p.selectionText.length > 60 ? '…' : ''}"`, click: () => this.newTab(this.resolveInput(p.selectionText.includes(' ') ? p.selectionText : p.selectionText + ' ')) }
       );
     }
@@ -756,6 +1006,7 @@ class Shell {
       { label: 'Full screen', accelerator: 'F11', click: () => this.win.setFullScreen(!this.win.isFullScreen()) },
       { type: 'separator' },
       { label: 'Admin console', visible: !!this.settings.isAdmin, click: () => this.newTab(this.controller.serverUrl + '/admin/') },
+      { label: 'Share this site’s sign-in with staff…', visible: !!this.settings.isAdmin, click: () => this.shareSessionMenu() },
       { label: 'Change my K-Browser password…', click: () => this.send('password-open') },
       { label: 'About K-Browser', click: () => this.notify({ level: 'info', text: `K-Browser ${app.getVersion()} · Chromium ${process.versions.chrome} · ${process.platform}` }) },
       { type: 'separator' },
@@ -846,6 +1097,7 @@ class Shell {
     this.closed = true;
     clearInterval(this.activityTimer);
     clearInterval(this.idleTimer);
+    clearInterval(this.usageTimer);
     contexts.delete(this.partition);
     this.controller.onShellClosed(this);
   }

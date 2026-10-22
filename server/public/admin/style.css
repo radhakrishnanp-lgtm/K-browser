@@ -90,7 +90,8 @@ fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 12px; d
 legend { font-weight: 600; padding: 0 6px; }
 .checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 4px 12px; max-height: 180px; overflow: auto; }
 .rules { display: grid; gap: 6px; }
-.rule { display: grid; grid-template-columns: 1fr 110px 1fr auto auto; gap: 6px; align-items: center; }
+.rule { display: grid; grid-template-columns: 1.4fr 90px 1.2fr 1fr auto auto; gap: 6px; align-items: center; }
+.rule.expired { opacity: .5; }
 .bm { display: grid; grid-template-columns: 1fr 2fr auto; gap: 6px; }
 .help { color: var(--muted); font-size: 12px; }
 .toast { position: fixed; bottom: 20px; right: 20px; background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; z-index: 20; max-width: 420px; }
@@ -103,3 +104,9 @@ legend { font-weight: 600; padding: 0 6px; }
   main { padding: 16px; }
   .modal .row, .rule, .bm { grid-template-columns: 1fr; }
 }
+.nav-h { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; padding: 12px 10px 4px; }
+.pill { background: #d92d20; color: #fff; border-radius: 99px; font-size: 11px; padding: 0 7px; margin-left: 4px; }
+.alert { border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; border: 1px solid var(--warn); color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, var(--panel)); }
+.bar { height: 8px; border-radius: 4px; background: var(--accent); min-width: 2px; }
+.flags { display: flex; flex-wrap: wrap; gap: 4px; }
+.sidebar { overflow-y: auto; }

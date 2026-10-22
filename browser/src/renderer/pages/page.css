@@ -23,3 +23,6 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .icon { font-size: 46px; }
 .url { word-break: break-all; color: var(--muted); font-size: 13px; background: var(--bg); padding: 8px 12px; border-radius: 8px; margin: 14px 0; }
 .actions { display: flex; gap: 10px; justify-content: center; margin-top: 18px; flex-wrap: wrap; }
+.request { display: grid; gap: 10px; margin-top: 16px; }
+.request textarea { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; min-height: 64px; resize: vertical; }
+[hidden] { display: none !important; }

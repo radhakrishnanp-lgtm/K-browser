@@ -1,5 +1,6 @@
 'use strict';
 const { randomToken, sha256, verifyPassword } = require('./crypto');
+const { CONSOLE_ROLES, can } = require('./rbac');
 
 const SESSION_TTL = {
   browser: 30 * 24 * 3600 * 1000, // idle timeout for staff browsers
@@ -87,7 +88,7 @@ function bearer(req) {
   return h.startsWith('Bearer ') ? h.slice(7).trim() : null;
 }
 
-function requireSession(store, { admin = false, kind = null } = {}) {
+function requireSession(store, { console: consoleOnly = false, kind = null } = {}) {
   return (req, res, next) => {
     const session = sessionFromToken(store, bearer(req));
     if (!session) return res.status(401).json({ error: 'Not signed in' });
@@ -97,7 +98,7 @@ function requireSession(store, { admin = false, kind = null } = {}) {
       return res.status(401).json({ error: 'Account disabled' });
     }
     if (kind && session.kind !== kind) return res.status(403).json({ error: 'Wrong session type' });
-    if (admin && user.role !== 'admin') return res.status(403).json({ error: 'Administrator access required' });
+    if (consoleOnly && !CONSOLE_ROLES.includes(user.role)) return res.status(403).json({ error: 'Administrator access required' });
     const now = Date.now();
     if (now - Date.parse(session.lastSeen) > 30000) {
       session.lastSeen = new Date(now).toISOString();
@@ -110,7 +111,12 @@ function requireSession(store, { admin = false, kind = null } = {}) {
   };
 }
 
+function need(perm) {
+  return (req, res, next) => (can(req.user, perm) ? next() : res.status(403).json({ error: 'Your role does not allow this action' }));
+}
+
 module.exports = {
+  need,
   LoginLimiter,
   clientIp,
   authenticate,

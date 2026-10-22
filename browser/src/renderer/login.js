@@ -16,7 +16,14 @@ async function doLogin() {
   busy(true);
   $('error').textContent = '';
   try {
-    const r = await window.kb.submit({ serverUrl: $('server').value, username: $('username').value.trim(), password: $('password').value });
+    const r = await window.kb.submit({ serverUrl: $('server').value, username: $('username').value.trim(), password: $('password').value, otp: $('otp').value.trim() });
+    if (r && r.needOtp) {
+      $('otp-row').hidden = false;
+      $('error').textContent = $('otp').value ? r.message : '';
+      $('otp').value = '';
+      $('otp').focus();
+      return;
+    }
     if (r && r.mustChangePassword) {
       password = $('password').value;
       show('newpw');

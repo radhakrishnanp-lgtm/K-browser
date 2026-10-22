@@ -97,4 +97,31 @@ function totp(secret, { time = Date.now(), step = 30, digits = 6, algorithm = 's
   return String(code).padStart(digits, '0');
 }
 
-module.exports = { hashPassword, verifyPassword, randomToken, sha256, randomPassword, Vault, totp, base32Decode };
+function verifyTotp(secret, code, { time = Date.now(), window = 1 } = {}) {
+  const clean = String(code || '').replace(/\s/g, '');
+  if (!/^\d{6}$/.test(clean)) return false;
+  for (let w = -window; w <= window; w++) {
+    const expected = totp(secret, { time: time + w * 30000 });
+    if (crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(clean))) return true;
+  }
+  return false;
+}
+
+function base32Encode(buf) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0;
+  let value = 0;
+  let out = '';
+  for (const byte of buf) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += alphabet[(value << (5 - bits)) & 31];
+  return out;
+}
+
+module.exports = { hashPassword, verifyPassword, randomToken, sha256, randomPassword, Vault, totp, verifyTotp, base32Decode, base32Encode };

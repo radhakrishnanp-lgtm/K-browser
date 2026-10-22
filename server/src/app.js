@@ -2,11 +2,13 @@
 const path = require('path');
 const express = require('express');
 const { LoginLimiter } = require('./auth');
+const { Seats } = require('./seats');
 const clientRoutes = require('./routes/client');
 const adminRoutes = require('./routes/admin');
 
 function createApp(ctx) {
   ctx.limiter = ctx.limiter || new LoginLimiter();
+  ctx.seats = ctx.seats || new Seats();
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', false);

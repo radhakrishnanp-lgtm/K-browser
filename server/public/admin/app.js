@@ -56,7 +56,11 @@ async function api(method, path, body) {
     throw new Error('Session expired, please sign in again');
   }
   const data = res.headers.get('content-type')?.includes('json') ? await res.json() : await res.text();
-  if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `Request failed (${res.status})`);
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -134,13 +138,15 @@ function checkList(items, selected, label) {
 function rulesEditor(rules) {
   const list = h('div', { class: 'rules' });
   const addRow = (r = { pattern: '', action: 'block', note: '', enabled: true }) => {
+    const expired = r.expiresAt && Date.parse(r.expiresAt) < Date.now();
     const row = h(
       'div',
-      { class: 'rule' },
-      h('input', { placeholder: 'e.g. youtube.com, *.example.com, https://site.com/path/*', value: r.pattern, 'data-k': 'pattern' }),
+      { class: 'rule' + (expired ? ' expired' : ''), 'data-expires': r.expiresAt || '' },
+      h('input', { placeholder: 'youtube.com, category:social, *.example.com …', value: r.pattern, 'data-k': 'pattern', list: 'kb-categories' }),
       h('select', { 'data-k': 'action' }, h('option', { value: 'block' }, 'Block'), h('option', { value: 'allow' }, 'Allow')),
+      h('input', { placeholder: 'When (optional): Mon-Fri 09:00-18:00', value: r.schedule || '', 'data-k': 'schedule', title: 'Leave empty for always. Examples: "Mon-Fri 09:00-18:00", "Sat,Sun", "13:00-14:00"' }),
       h('input', { placeholder: 'Note (optional)', value: r.note || '', 'data-k': 'note' }),
-      h('label', { class: 'check', title: 'Enabled' }, h('input', { type: 'checkbox', checked: r.enabled !== false, 'data-k': 'enabled' }), 'On'),
+      h('label', { class: 'check', title: r.expiresAt ? `Expires ${fmtTime(r.expiresAt)}` : 'Enabled' }, h('input', { type: 'checkbox', checked: r.enabled !== false, 'data-k': 'enabled' }), r.expiresAt ? (expired ? 'Expired' : 'Until ' + new Date(r.expiresAt).toLocaleDateString()) : 'On'),
       h('button', { type: 'button', class: 'small danger', onclick: () => row.remove() }, '✕')
     );
     row.querySelector('[data-k=action]').value = r.action === 'allow' ? 'allow' : 'block';
@@ -159,9 +165,11 @@ function rulesEditor(rules) {
         pattern: row.querySelector('[data-k=pattern]').value.trim(),
         action: row.querySelector('[data-k=action]').value,
         note: row.querySelector('[data-k=note]').value.trim(),
+        schedule: row.querySelector('[data-k=schedule]').value.trim(),
+        expiresAt: row.dataset.expires || undefined,
         enabled: row.querySelector('[data-k=enabled]').checked,
       }))
-      .filter((r) => r.pattern);
+      .filter((r) => r.pattern && !(r.expiresAt && Date.parse(r.expiresAt) < Date.now()));
   return wrap;
 }
 
@@ -249,15 +257,32 @@ const userName = (id) => {
 
 // ---- pages --------------------------------------------------------------------
 const pages = {};
+const ROLE_LABELS = { admin: 'Admin', helpdesk: 'Helpdesk', auditor: 'Auditor', user: 'Staff' };
+const money = (n) => {
+  try {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency: state.currency || 'INR', maximumFractionDigits: 0 }).format(n || 0);
+  } catch {
+    return `${state.currency || ''} ${Math.round(n || 0)}`;
+  }
+};
+const duration = (secs) => {
+  const m = Math.round(secs / 60);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+};
 
 pages.dashboard = async (main) => {
   const o = await api('GET', '/admin/overview');
   $('#org-name').textContent = o.orgName;
+  state.currency = o.settings.currency;
+  setRequestCount(o.pendingRequests);
+  if (!o.me.twoFactor) main.append(h('div', { class: 'alert' }, 'Your console account is not protected by two-factor authentication. ', h('a', { href: '#security' }, 'Set it up now'), '.'));
+  if (o.pendingRequests) main.append(h('div', { class: 'alert' }, `${o.pendingRequests} access request(s) are waiting for you. `, h('a', { href: '#requests' }, 'Review')));
+  for (const r of o.subscriptions.renewalsSoon) main.append(h('div', { class: 'alert' }, `Subscription "${r.name}" renews on ${r.renewalDate}.`));
   const stat = (n, l) => h('div', { class: 'stat' }, h('div', { class: 'n' }, n), h('div', { class: 'l' }, l));
   main.append(
     h('h1', {}, 'Dashboard'),
     h('p', { class: 'sub' }, `Server ${o.server.hostname} · v${o.server.version}`),
-    h('div', { class: 'grid' }, stat(o.online, 'Browsers online'), stat(o.users, 'Users'), stat(o.credentials, 'Site logins'), stat(o.last24h.visits, 'Page visits (24h)'), stat(o.last24h.blocked, 'Blocked (24h)'), stat(o.last24h.fills, 'Auto sign-ins (24h)'), stat(o.last24h.failedLogins, 'Failed logins (24h)')),
+    h('div', { class: 'grid' }, stat(o.online, 'Browsers online'), stat(o.users, 'Users'), stat(o.credentials, 'Site logins'), stat(o.last24h.visits, 'Page visits (24h)'), stat(o.last24h.blocked, 'Blocked (24h)'), stat(o.last24h.fills, 'Auto sign-ins (24h)'), stat(o.last24h.failedLogins, 'Failed logins (24h)'), stat(o.pendingRequests, 'Pending requests'), stat(o.subscriptions.seatsInUse, 'Licence seats in use'), stat(money(o.subscriptions.monthlyCost), 'Subscriptions / month')),
     h('div', { style: 'height:16px' }),
     h(
       'div',
@@ -373,7 +398,7 @@ async function editUser(user) {
     displayName: h('input', { value: user.displayName || '' }),
     email: h('input', { value: user.email || '', type: 'email' }),
     password: h('input', { type: 'password', placeholder: isNew ? 'Leave blank to generate one' : 'Leave blank to keep current', autocomplete: 'new-password' }),
-    role: h('select', {}, h('option', { value: 'user' }, 'Staff'), h('option', { value: 'admin' }, 'Administrator')),
+    role: h('select', {}, h('option', { value: 'user' }, 'Staff'), h('option', { value: 'helpdesk' }, 'Helpdesk (console: users, sessions, requests)'), h('option', { value: 'auditor' }, 'Auditor (console: read-only)'), h('option', { value: 'admin' }, 'Administrator (full control)')),
     enabled: h('input', { type: 'checkbox', checked: user.enabled !== false }),
     mustChange: h('input', { type: 'checkbox', checked: !!user.mustChangePassword }),
     groups: checkList(state.groups, user.groupIds, (g) => g.name),
@@ -443,7 +468,7 @@ pages.users = async (main) => {
                 'tr',
                 {},
                 h('td', {}, h('span', { class: 'dot' + (u.online ? ' on' : '') }), h('strong', {}, u.username), u.displayName ? h('div', { class: 'muted' }, u.displayName) : null),
-                h('td', {}, u.role === 'admin' ? h('span', { class: 'badge warn' }, 'Admin') : 'Staff'),
+                h('td', {}, u.role === 'user' ? 'Staff' : h('span', { class: 'badge warn' }, ROLE_LABELS[u.role] || u.role), u.twoFactor ? h('span', { class: 'badge ok', title: 'Two-factor authentication on' }, '2FA') : null),
                 h('td', {}, u.groupIds.map(groupName).join(', ') || h('span', { class: 'muted' }, '—')),
                 h('td', {}, u.enabled ? h('span', { class: 'badge ok' }, 'Enabled') : h('span', { class: 'badge off' }, 'Disabled')),
                 h('td', {}, ago(u.lastLoginAt)),
@@ -467,6 +492,9 @@ pages.users = async (main) => {
                       },
                       'Reset password'
                     ),
+                    u.twoFactor
+                      ? h('button', { class: 'small', onclick: async () => { if (await confirmBox(`Turn off two-factor authentication for ${u.username}? They can set it up again after signing in.`, 'Reset 2FA')) { await api('POST', `/admin/users/${u.id}/reset-2fa`, {}); route(); } } }, 'Reset 2FA')
+                      : null,
                     h(
                       'button',
                       {
@@ -609,6 +637,11 @@ pages.credentials = async (main) => {
       password: h('input', { type: 'password', autocomplete: 'new-password', placeholder: c.hasPassword ? '•••••••• (saved — type to replace)' : 'Account password' }),
       totp: h('input', { autocomplete: 'off', placeholder: c.hasTotp ? '(saved — type to replace)' : 'Optional: base32 2FA secret, e.g. JBSWY3DPEHPK3PXP' }),
       clearTotp: h('input', { type: 'checkbox' }),
+      plan: h('input', { value: c.plan || '', placeholder: 'e.g. Canva Teams – annual' }),
+      vendor: h('input', { value: c.vendor || '', placeholder: 'e.g. Canva' }),
+      seats: h('input', { type: 'number', min: 0, value: c.seats || 0 }),
+      costMonthly: h('input', { type: 'number', min: 0, step: '0.01', value: c.costMonthly || 0 }),
+      renewalDate: h('input', { type: 'date', value: c.renewalDate || '' }),
       autoFill: h('input', { type: 'checkbox', checked: c.autoFill }),
       autoSubmit: h('input', { type: 'checkbox', checked: c.autoSubmit }),
       showOnNewTab: h('input', { type: 'checkbox', checked: c.showOnNewTab }),
@@ -631,6 +664,23 @@ pages.credentials = async (main) => {
         h('label', {}, 'Websites this login is used on', f.match, h('span', { class: 'help' }, 'Leave empty to use the login page domain. "example.com" also covers its subdomains.')),
         h('fieldset', {}, h('legend', {}, 'Account (stored encrypted, never shown to staff)'), h('div', { class: 'row' }, h('label', {}, 'Username / email', f.username), h('label', {}, 'Password', f.password)), h('label', {}, 'Two-factor (TOTP) secret', f.totp), c.hasTotp ? h('label', { class: 'check' }, f.clearTotp, 'Remove saved 2FA secret') : null),
         h('fieldset', {}, h('legend', {}, 'Who can use it'), h('label', { class: 'check' }, f.everyone, 'Everyone'), h('div', {}, h('strong', {}, 'Groups'), f.groups), h('div', {}, h('strong', {}, 'Users'), f.users), h('span', { class: 'help' }, 'If a user has several logins for the same site, a personal assignment wins over a group one; they can switch from the key icon in the address bar.')),
+        h(
+          'fieldset',
+          {},
+          h('legend', {}, 'Subscription & licence'),
+          h('div', { class: 'row' }, h('label', {}, 'Plan', f.plan), h('label', {}, 'Vendor', f.vendor)),
+          h('div', { class: 'row' }, h('label', {}, 'Seats (max people at the same time, 0 = no limit)', f.seats), h('label', {}, 'Monthly cost', f.costMonthly)),
+          h('label', {}, 'Renewal date', f.renewalDate)
+        ),
+        h(
+          'fieldset',
+          {},
+          h('legend', {}, 'Shared signed-in session (no password needed)'),
+          c.hasSession
+            ? h('div', {}, h('span', { class: 'badge ok' }, 'Session shared'), ` by ${c.sessionCapturedBy || '?'} · ${fmtTime(c.sessionCapturedAt)} `, h('button', { type: 'button', class: 'small danger', onclick: async () => { await api('DELETE', `/admin/credentials/${c.id}/session`); toast('Shared session removed'); } }, 'Remove'))
+            : h('div', { class: 'muted' }, 'None.'),
+          h('span', { class: 'help' }, 'To share: sign in to the website in your own K-Browser, then open the ⋮ menu → "Share this site’s sign-in with staff…". Staff assigned to this login are then signed in with your session — the password never leaves your computer. Re-share when the site logs you out.')
+        ),
         h('fieldset', {}, h('legend', {}, 'Behaviour'), h('label', { class: 'check' }, f.autoFill, 'Fill automatically when the login page opens'), h('label', { class: 'check' }, f.autoSubmit, 'Press the sign-in button automatically'), h('label', { class: 'check' }, f.showOnNewTab, 'Show as a shortcut on the new tab page'), h('label', { class: 'check' }, f.enabled, 'Enabled')),
         h('fieldset', {}, h('legend', {}, 'Advanced: CSS selectors (only if auto-detect fails)'), h('div', { class: 'row' }, h('label', {}, 'Username field', f.usernameSelector), h('label', {}, 'Password field', f.passwordSelector)), h('div', { class: 'row' }, h('label', {}, '2FA code field', f.totpSelector), h('label', {}, 'Submit button', f.submitSelector))),
         h('label', {}, 'Notes', f.notes)
@@ -655,6 +705,11 @@ pages.credentials = async (main) => {
             totpSelector: f.totpSelector.value,
             submitSelector: f.submitSelector.value,
             notes: f.notes.value,
+            plan: f.plan.value,
+            vendor: f.vendor.value,
+            seats: Number(f.seats.value) || 0,
+            costMonthly: Number(f.costMonthly.value) || 0,
+            renewalDate: f.renewalDate.value,
           };
           if (f.password.value) body.password = f.password.value;
           if (f.totp.value) body.totpSecret = f.totp.value;
@@ -687,7 +742,7 @@ pages.credentials = async (main) => {
                   {},
                   h('td', {}, h('strong', {}, c.name), c.enabled ? null : h('span', { class: 'badge off' }, 'disabled'), c.notes ? h('div', { class: 'muted' }, c.notes) : null),
                   h('td', {}, c.match.join(', ')),
-                  h('td', {}, c.username || '—', h('div', {}, c.hasPassword ? h('span', { class: 'badge ok' }, 'password') : h('span', { class: 'badge bad' }, 'no password'), ' ', c.hasTotp ? h('span', { class: 'badge ok' }, '2FA') : null, ' ', c.autoSubmit ? h('span', { class: 'badge' }, 'auto-submit') : null)),
+                  h('td', {}, c.username || '—', h('div', {}, c.hasPassword ? h('span', { class: 'badge ok' }, 'password') : c.hasSession ? null : h('span', { class: 'badge bad' }, 'no password'), ' ', c.hasSession ? h('span', { class: 'badge ok' }, 'shared session') : null, ' ', c.seats ? h('span', { class: 'badge' }, `${c.seatsInUse.length}/${c.seats} seats`) : null, ' ', c.hasTotp ? h('span', { class: 'badge ok' }, '2FA') : null, ' ', c.autoSubmit ? h('span', { class: 'badge' }, 'auto-submit') : null)),
                   h('td', {}, who(c)),
                   h(
                     'td',
@@ -709,7 +764,7 @@ pages.credentials = async (main) => {
 };
 
 pages.filter = async (main) => {
-  const policy = await api('GET', '/admin/policy');
+  const [policy, cats] = await Promise.all([api('GET', '/admin/policy'), api('GET', '/admin/categories')]);
   const mode = modeSelect(policy.mode, false);
   const rules = rulesEditor(policy.rules);
   const testInput = h('input', { placeholder: 'https://www.youtube.com/watch?v=…' });
@@ -739,9 +794,20 @@ pages.filter = async (main) => {
         h('code', {}, '192.168.1.0/24'),
         ' · ',
         h('code', {}, '*'),
-        ' (everything)'
+        ' (everything) · ',
+        h('code', {}, 'category:social'),
+        ' (built-in category). "When" limits a rule to certain times, e.g. ',
+        h('code', {}, 'Mon-Fri 09:00-18:00'),
+        ' blocks only during office hours.'
       ),
       h('div', {}, h('button', { class: 'primary', onclick: async () => { await api('PUT', '/admin/policy', { mode: mode.value, rules: rules.values() }); toast('Web filter saved and pushed to all browsers'); } }, 'Save & push to browsers'))
+    ),
+    h(
+      'div',
+      { class: 'panel' },
+      h('h2', {}, 'Built-in categories'),
+      h('p', { class: 'help' }, 'Use these as patterns, e.g. block category:social Mon-Fri 09:00-18:00.'),
+      h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, cats.map((c) => h('tr', {}, h('td', {}, h('code', {}, `category:${c.key}`)), h('td', {}, c.label), h('td', { class: 'muted' }, `${c.examples.join(', ')} … (${c.count})`))))))
     ),
     h('div', { class: 'panel' }, h('h2', {}, 'Test a URL against the global rules'), h('div', { class: 'toolbar' }, testInput, h('button', { onclick: async () => { const r = await api('POST', '/admin/policy/test', { url: testInput.value }); testOut.textContent = r.allowed ? '✔ Allowed' : '✖ Blocked'; testOut.textContent += r.rule ? ` by "${r.rule.pattern}"` : ` (${r.reason})`; } }, 'Test'), testOut), h('p', { class: 'help' }, 'Note: save first; the test uses the saved rules. Use "Effective access" on a user to test their combined rules.'))
   );
@@ -766,7 +832,9 @@ pages.activity = async (main) => {
     h('option', { value: '' }, 'All events'),
     h('option', { value: 'visit' }, 'Page visits'),
     h('option', { value: 'blocked,access.request' }, 'Blocked sites & access requests'),
-    h('option', { value: 'credential.fill' }, 'Auto sign-ins'),
+    h('option', { value: 'credential.fill,session.use' }, 'Auto sign-ins & shared sessions'),
+    h('option', { value: 'dlp.blocked' }, 'Data protection blocks'),
+    h('option', { value: 'seat.denied' }, 'Licence seat full'),
     h('option', { value: 'login,logout,login.failed' }, 'K-Browser sign-ins'),
     h('option', { value: 'download,download.blocked' }, 'Downloads'),
     h('option', { value: 'admin.user.create,admin.user.update,admin.user.delete,admin.credential.create,admin.credential.update,admin.credential.delete,admin.policy.update,admin.settings.update,admin.group.create,admin.group.update,admin.group.delete,admin.bookmarks.update,admin.session.logout,admin.user.reset-password' }, 'Admin changes')
@@ -821,6 +889,13 @@ pages.settings = async (main) => {
       field('loginBanner', 'Sign-in notice shown to staff', 'area', 'e.g. "Browsing on this computer is monitored according to company policy."'),
       h('div', { class: 'row' }, field('idleLogoutMinutes', 'Auto sign-out after idle minutes (0 = never)', 'num'), field('maxTabs', 'Maximum open tabs (0 = unlimited)', 'num')),
       field('blockedDownloadExtensions', 'Blocked download file types', 'list', 'Comma separated, e.g. exe, msi, bat'),
+      h('div', { class: 'row' }, field('currency', 'Currency for subscription costs', 'text', 'e.g. INR, USD, EUR'), field('usageRetentionDays', 'Keep usage statistics for (days)', 'num')),
+      h('div', { class: 'row' }, field('safeSearch', 'Force SafeSearch on Google, Bing and DuckDuckGo', 'bool'), (() => {
+        const sel = h('select', {}, h('option', { value: 'off' }, 'Off'), h('option', { value: 'moderate' }, 'Moderate'), h('option', { value: 'strict' }, 'Strict'));
+        sel.value = s.youtubeRestrict || 'off';
+        f.youtubeRestrict = { input: sel, type: 'text' };
+        return h('label', {}, 'YouTube Restricted Mode', sel);
+      })()),
       h('div', { class: 'checks', style: 'max-height:none' }, field('logActivity', 'Log browsing activity', 'bool'), field('allowDownloads', 'Allow downloads', 'bool'), field('allowPrinting', 'Allow printing', 'bool'), field('allowMedia', 'Allow camera / microphone', 'bool'), field('allowDevTools', 'Allow developer tools', 'bool'), field('allowFileUrls', 'Allow opening local files', 'bool'), field('clearDataOnLogout', 'Clear cookies on sign-out', 'bool')),
       h(
         'div',
@@ -866,6 +941,316 @@ pages.deploy = async (main) => {
   );
 };
 
+
+function setRequestCount(n) {
+  const el = $('#req-count');
+  el.hidden = !n;
+  el.textContent = n || '';
+}
+
+pages.requests = async (main) => {
+  const list = await api('GET', '/admin/requests');
+  const pending = list.filter((a) => a.status === 'pending');
+  setRequestCount(pending.length);
+  const decide = async (a, decision) => {
+    if (decision === 'deny') {
+      const note = h('input', { placeholder: 'Reason shown to the user (optional)' });
+      const ok = await modal(`Decline ${a.username}'s request`, h('div', { class: 'rules' }, h('div', {}, a.url), h('label', {}, 'Note', note)), { onSave: () => api('POST', `/admin/requests/${a.id}/deny`, { note: note.value }), saveLabel: 'Decline' });
+      if (ok) route();
+      return;
+    }
+    const dur = h('select', {}, h('option', { value: '60' }, '1 hour'), h('option', { value: '240' }, '4 hours'), h('option', { value: '1440' }, '1 day'), h('option', { value: '10080' }, '7 days'), h('option', { value: '43200' }, '30 days'), h('option', { value: '0' }, 'Permanently'));
+    const pattern = h('input', { value: a.host.replace(/^www\./, '') });
+    const ok = await modal(
+      `Approve ${a.username}'s request`,
+      h('div', { class: 'rules' }, h('div', {}, h('strong', {}, 'Site: '), a.url), a.reason ? h('div', {}, h('strong', {}, 'Reason: '), a.reason) : null, h('label', {}, 'Allow this pattern', pattern), h('label', {}, 'For how long', dur), h('p', { class: 'help' }, 'Adds a personal allow rule for this user only. Time-limited rules switch off automatically.')),
+      { onSave: () => api('POST', `/admin/requests/${a.id}/approve`, { minutes: Number(dur.value), pattern: pattern.value }), saveLabel: 'Approve' }
+    );
+    if (ok) route();
+  };
+  const table = (rows, actions) =>
+    rows.length
+      ? h(
+          'div',
+          { class: 'table-wrap' },
+          h(
+            'table',
+            {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'User'), h('th', {}, 'Site'), h('th', {}, 'Reason'), h('th', {}, actions ? '' : 'Decision'))),
+            h(
+              'tbody',
+              {},
+              rows.map((a) =>
+                h(
+                  'tr',
+                  {},
+                  h('td', { title: fmtTime(a.createdAt) }, ago(a.createdAt)),
+                  h('td', {}, a.username),
+                  h('td', {}, h('strong', {}, a.host), h('div', { class: 'url' }, a.url)),
+                  h('td', {}, a.reason || h('span', { class: 'muted' }, '—')),
+                  h(
+                    'td',
+                    {},
+                    actions
+                      ? h('div', { class: 'actions' }, h('button', { class: 'small primary', onclick: () => decide(a, 'approve') }, 'Approve…'), h('button', { class: 'small danger', onclick: () => decide(a, 'deny') }, 'Decline'))
+                      : h('div', {}, h('span', { class: 'badge ' + (a.status === 'approved' ? 'ok' : 'bad') }, a.status), ` by ${a.decidedBy || '?'}`, a.expiresAt ? h('div', { class: 'muted' }, `until ${fmtTime(a.expiresAt)}`) : null, a.note ? h('div', { class: 'muted' }, a.note) : null)
+                  )
+                )
+              )
+            )
+          )
+        )
+      : h('p', { class: 'muted' }, 'Nothing here.');
+  main.append(
+    h('h1', {}, 'Access requests'),
+    h('p', { class: 'sub' }, 'Staff can ask for a blocked website from the block page. Approve it for a limited time or permanently.'),
+    h('h2', {}, `Waiting (${pending.length})`),
+    table(pending, true),
+    h('h2', { style: 'margin-top:22px' }, 'History'),
+    table(list.filter((a) => a.status !== 'pending').slice(0, 100), false)
+  );
+};
+
+pages.subscriptions = async (main) => {
+  const d = await api('GET', '/admin/subscriptions');
+  state.currency = d.currency;
+  const soon = Date.now() + 30 * 24 * 3600 * 1000;
+  main.append(
+    h('h1', {}, 'Subscriptions'),
+    h('p', { class: 'sub' }, 'Every paid account in the vault: cost, seats, who can use it and how much it is really used. Edit the details under Site logins.'),
+    h('div', { class: 'grid' }, h('div', { class: 'stat' }, h('div', { class: 'n' }, money(d.monthlyCost)), h('div', { class: 'l' }, 'Total per month')), h('div', { class: 'stat' }, h('div', { class: 'n' }, money(d.monthlyCost * 12)), h('div', { class: 'l' }, 'Per year')), h('div', { class: 'stat' }, h('div', { class: 'n' }, d.items.length), h('div', { class: 'l' }, 'Accounts')), h('div', { class: 'stat' }, h('div', { class: 'n' }, d.seatsInUse), h('div', { class: 'l' }, 'Seats in use now'))),
+    h('div', { style: 'height:16px' }),
+    h(
+      'div',
+      { class: 'table-wrap' },
+      h(
+        'table',
+        {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Account'), h('th', {}, 'Seats in use'), h('th', {}, 'Eligible users'), h('th', {}, 'Used (30 days)'), h('th', {}, 'Cost / month'), h('th', {}, 'Cost per active user'), h('th', {}, 'Renews'))),
+        h(
+          'tbody',
+          {},
+          d.items.map((c) =>
+            h(
+              'tr',
+              {},
+              h('td', {}, h('strong', {}, c.name), h('div', { class: 'muted' }, [c.vendor, c.plan].filter(Boolean).join(' · ')), c.hasSession ? h('span', { class: 'badge ok' }, 'shared session') : null),
+              h('td', {}, c.seats ? `${c.seatsInUse.length} / ${c.seats}` : `${c.seatsInUse.length} (no limit)`, c.seatsInUse.length ? h('div', { class: 'muted' }, c.seatsInUse.join(', ')) : null),
+              h('td', {}, c.eligibleUsers),
+              h('td', {}, `${c.activeUsers30d} user(s)`, h('div', { class: 'muted' }, `${c.uses30d} sign-ins`)),
+              h('td', {}, c.costMonthly ? money(c.costMonthly) : '—'),
+              h('td', {}, c.costMonthly && c.activeUsers30d ? money(c.costMonthly / c.activeUsers30d) : c.costMonthly ? h('span', { class: 'badge bad' }, 'unused') : '—'),
+              h('td', {}, c.renewalDate ? h('span', { class: Date.parse(c.renewalDate) <= soon ? 'badge warn' : '' }, c.renewalDate) : '—')
+            )
+          )
+        )
+      )
+    )
+  );
+};
+
+const DLP_FIELDS = [
+  ['blockCopy', 'Block copy / cut'],
+  ['blockPaste', 'Block paste / drop'],
+  ['blockUpload', 'Block file uploads'],
+  ['blockDownload', 'Block downloads'],
+  ['blockPrint', 'Block printing'],
+  ['watermark', 'Show watermark (user · PC · time)'],
+  ['screenshotProtect', 'Block screenshots & screen sharing (Windows)'],
+];
+
+pages.dlp = async (main) => {
+  await loadDirectory();
+  let rules = await api('GET', '/admin/dlp');
+  const save = async () => {
+    rules = await api('PUT', '/admin/dlp', rules);
+    toast('Data protection rules saved and pushed to all browsers');
+    route();
+  };
+  const edit = async (rule) => {
+    const isNew = !rule;
+    rule = rule || { name: '', match: [], everyone: true, groupIds: [], userIds: [], enabled: true };
+    const f = {
+      name: h('input', { value: rule.name, placeholder: 'e.g. CRM — customer data' }),
+      match: h('textarea', { placeholder: 'One per line: crm.example.com, category:filesharing …', list: 'kb-categories' }, (rule.match || []).join('\n')),
+      everyone: h('input', { type: 'checkbox', checked: rule.everyone }),
+      groups: checkList(state.groups, rule.groupIds, (g) => g.name),
+      users: checkList(state.users, rule.userIds, (u) => u.displayName || u.username),
+      enabled: h('input', { type: 'checkbox', checked: rule.enabled !== false }),
+    };
+    const flags = DLP_FIELDS.map(([k, label]) => {
+      const cb = h('input', { type: 'checkbox', checked: !!rule[k], 'data-k': k });
+      return h('label', { class: 'check' }, cb, label);
+    });
+    const ok = await modal(
+      isNew ? 'Add data protection rule' : `Edit ${rule.name}`,
+      h(
+        'div',
+        { class: 'rules' },
+        h('label', {}, 'Name', f.name),
+        h('label', {}, 'Websites', f.match),
+        h('fieldset', {}, h('legend', {}, 'Restrictions'), h('div', { class: 'checks', style: 'max-height:none' }, flags)),
+        h('fieldset', {}, h('legend', {}, 'Applies to'), h('label', { class: 'check' }, f.everyone, 'Everyone'), h('div', {}, h('strong', {}, 'Groups'), f.groups), h('div', {}, h('strong', {}, 'Users'), f.users)),
+        h('label', { class: 'check' }, f.enabled, 'Enabled')
+      ),
+      {
+        wide: true,
+        onSave: async () => {
+          const row = { ...rule, name: f.name.value, match: f.match.value.split(/[\n,]/).map((x) => x.trim()).filter(Boolean), everyone: f.everyone.checked, groupIds: f.groups.values(), userIds: f.users.values(), enabled: f.enabled.checked };
+          for (const cb of flags.map((l) => l.querySelector('input'))) row[cb.dataset.k] = cb.checked;
+          if (!row.match.length) throw new Error('Add at least one website');
+          rules = isNew ? [...rules, row] : rules.map((x) => (x === rule ? row : x));
+          return true;
+        },
+      }
+    );
+    if (ok) await save();
+  };
+  const who = (r) => [r.everyone ? 'Everyone' : null, ...(r.groupIds || []).map((id) => 'Group: ' + groupName(id)), ...(r.userIds || []).map(userName)].filter(Boolean).join(', ') || '— nobody —';
+  main.append(
+    h('h1', {}, 'Data protection'),
+    h('p', { class: 'sub' }, 'Stop company data leaving through the browser: block copy, paste, uploads, downloads, printing and screenshots on chosen websites, and stamp pages with a visible watermark that identifies the user.'),
+    h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), h('button', { class: 'primary', onclick: () => edit() }, '+ Add rule')),
+    rules.length
+      ? h(
+          'div',
+          { class: 'table-wrap' },
+          h(
+            'table',
+            {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Rule'), h('th', {}, 'Websites'), h('th', {}, 'Restrictions'), h('th', {}, 'Applies to'), h('th', {}, ''))),
+            h(
+              'tbody',
+              {},
+              rules.map((r) =>
+                h(
+                  'tr',
+                  {},
+                  h('td', {}, h('strong', {}, r.name), r.enabled === false ? h('span', { class: 'badge off' }, 'off') : null),
+                  h('td', {}, r.match.join(', ')),
+                  h('td', {}, h('div', { class: 'flags' }, DLP_FIELDS.filter(([k]) => r[k]).map(([, label]) => h('span', { class: 'badge' }, label.replace(/ \(.*\)/, ''))))),
+                  h('td', {}, who(r)),
+                  h('td', {}, h('div', { class: 'actions' }, h('button', { class: 'small', onclick: () => edit(r) }, 'Edit'), h('button', { class: 'small danger', onclick: async () => { if (await confirmBox(`Delete rule ${r.name}?`, 'Delete')) { rules = rules.filter((x) => x !== r); await save(); } } }, 'Delete')))
+                )
+              )
+            )
+          )
+        )
+      : h('p', { class: 'muted' }, 'No rules yet. Example: protect your CRM or accounting site so customer data cannot be copied, downloaded or printed.')
+  );
+};
+
+pages.reports = async (main) => {
+  await loadDirectory();
+  const today = new Date().toISOString().slice(0, 10);
+  const weekAgo = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+  const from = h('input', { type: 'date', value: weekAgo });
+  const to = h('input', { type: 'date', value: today });
+  const user = h('select', {}, h('option', { value: '' }, 'All users'), state.users.map((u) => h('option', { value: u.id }, u.username)));
+  const groupBy = h('select', {}, h('option', { value: 'user' }, 'Per user and site'), h('option', { value: 'host' }, 'Per site (all users)'));
+  const out = h('div');
+  const params = () => new URLSearchParams({ from: from.value, to: to.value, userId: user.value, groupBy: groupBy.value });
+  const load = async () => {
+    const d = await api('GET', '/admin/reports/usage?' + params());
+    const max = Math.max(1, ...d.rows.map((r) => r.seconds));
+    const total = d.rows.reduce((n, r) => n + r.seconds, 0);
+    out.replaceChildren(
+      h('p', { class: 'muted' }, `${d.from} → ${d.to} · total active browsing ${duration(total)}`),
+      d.rows.length
+        ? h(
+            'div',
+            { class: 'table-wrap' },
+            h(
+              'table',
+              {},
+              h('thead', {}, h('tr', {}, groupBy.value === 'user' ? h('th', {}, 'User') : null, h('th', {}, 'Site'), h('th', {}, 'Active time'), h('th', { style: 'width:40%' }, ''))),
+              h('tbody', {}, d.rows.slice(0, 300).map((r) => h('tr', {}, groupBy.value === 'user' ? h('td', {}, r.username) : null, h('td', {}, r.host), h('td', {}, duration(r.seconds)), h('td', {}, h('div', { class: 'bar', style: `width:${Math.round((r.seconds / max) * 100)}%` })))))
+            )
+          )
+        : h('p', { class: 'muted' }, 'No usage recorded for this period.')
+    );
+  };
+  for (const el of [from, to, user, groupBy]) el.addEventListener('change', load);
+  main.append(
+    h('h1', {}, 'Usage reports'),
+    h('p', { class: 'sub' }, 'Active time per website (only while K-Browser is in front and the user is not idle). Requires "Log browsing activity".'),
+    h('div', { class: 'toolbar' }, from, to, user, groupBy, h('span', { class: 'spacer' }), h('button', { onclick: () => download('/admin/reports/usage.csv?' + params(), 'kbrowser-usage.csv') }, 'Export CSV')),
+    out
+  );
+  load();
+};
+
+pages.security = async (main) => {
+  const [me, settings, integrity] = await Promise.all([api('GET', '/auth/me'), api('GET', '/admin/settings').catch(() => null), api('GET', '/admin/audit/verify')]);
+  const twoFa = h('div', { class: 'panel rules' }, h('h2', {}, 'Two-factor authentication for your account'));
+  if (me.user.twoFactor) {
+    const pw = h('input', { type: 'password', placeholder: 'Your password' });
+    twoFa.append(h('p', {}, h('span', { class: 'badge ok' }, 'On'), ' Your account asks for an authenticator code at sign-in.'), h('div', { class: 'toolbar' }, pw, h('button', { class: 'danger', onclick: async () => { await api('POST', '/auth/2fa/disable', { password: pw.value }); toast('Two-factor authentication turned off'); route(); } }, 'Turn off')));
+  } else {
+    const start = h('button', { class: 'primary' }, 'Set up two-factor authentication');
+    start.addEventListener('click', async () => {
+      const r = await api('POST', '/auth/2fa/setup', {});
+      const code = h('input', { inputmode: 'numeric', maxlength: 6, placeholder: '6-digit code' });
+      start.replaceWith(
+        h(
+          'div',
+          { class: 'rules' },
+          h('p', {}, 'In Google Authenticator, Microsoft Authenticator, Authy or similar choose "Enter a setup key" and type this key (time based):'),
+          h('div', { class: 'secret' }, r.secret.replace(/(.{4})/g, '$1 ').trim()),
+          h('p', { class: 'help' }, 'Or paste this link into a password manager that supports TOTP: ', h('code', {}, r.uri)),
+          h('div', { class: 'toolbar' }, code, h('button', { class: 'primary', onclick: async () => { try { await api('POST', '/auth/2fa/enable', { code: code.value }); toast('Two-factor authentication is on'); route(); } catch (err) { toast(err.message); } } }, 'Verify & turn on'))
+        )
+      );
+    });
+    twoFa.append(h('p', {}, h('span', { class: 'badge bad' }, 'Off'), ' Anyone who learns your password can open this console.'), h('div', {}, start));
+  }
+  main.append(h('h1', {}, 'Security'), h('p', { class: 'sub' }, 'Protect the console, get alerts, and check the audit trail has not been tampered with.'), twoFa);
+
+  if (settings) {
+    const require2fa = h('input', { type: 'checkbox', checked: settings.requireAdmin2fa });
+    const url = h('input', { value: settings.webhookUrl || '', placeholder: 'https://hooks.slack.com/services/… or Teams / Google Chat / Discord webhook' });
+    const EVENTS = [
+      ['blocked', 'Blocked website attempts'],
+      ['access.request', 'Access requests'],
+      ['login.failed', 'Failed sign-ins'],
+      ['seat.denied', 'Licence seat full'],
+      ['dlp.blocked', 'Data protection blocks'],
+      ['admin.credential.update', 'Site login changes'],
+      ['admin.user.create', 'New users'],
+      ['admin.session.capture', 'Shared sessions'],
+    ];
+    const evs = EVENTS.map(([k, label]) => h('label', { class: 'check' }, h('input', { type: 'checkbox', value: k, checked: (settings.webhookEvents || []).includes(k) }), label));
+    main.append(
+      h(
+        'div',
+        { class: 'panel rules' },
+        h('h2', {}, 'Policies'),
+        h('label', { class: 'check' }, require2fa, 'Require two-factor authentication for all console accounts'),
+        h('h2', { style: 'margin-top:10px' }, 'Alerts (webhook)'),
+        h('label', {}, 'Webhook URL', url),
+        h('div', { class: 'checks', style: 'max-height:none' }, evs),
+        h(
+          'div',
+          { class: 'toolbar' },
+          h('button', { class: 'primary', onclick: async () => { await api('PUT', '/admin/settings', { requireAdmin2fa: require2fa.checked, webhookUrl: url.value.trim(), webhookEvents: evs.map((l) => l.querySelector('input')).filter((i) => i.checked).map((i) => i.value) }); toast('Saved'); } }, 'Save'),
+          h('button', { onclick: async () => { const r = await api('POST', '/admin/settings/test-webhook', {}); toast(r.ok ? 'Test alert sent' : `Webhook failed: ${r.error || r.status}`); } }, 'Send test alert')
+        )
+      )
+    );
+  }
+
+  main.append(
+    h(
+      'div',
+      { class: 'panel' },
+      h('h2', {}, 'Audit log integrity'),
+      integrity.ok
+        ? h('p', {}, h('span', { class: 'badge ok' }, 'Verified'), ` All ${integrity.checked} recent log entries are intact. Each entry is chained to the previous one with SHA-256, so editing or deleting a line is detected.`)
+        : h('p', {}, h('span', { class: 'badge bad' }, 'Tampering detected'), ` The chain breaks at the entry from ${fmtTime(integrity.brokenAt && integrity.brokenAt.ts)} (${integrity.brokenAt && integrity.brokenAt.type}).`)
+    )
+  );
+};
+
 // ---- shell ----------------------------------------------------------------------
 async function route() {
   const name = (location.hash || '#dashboard').slice(1);
@@ -884,7 +1269,10 @@ async function route() {
 function showApp() {
   $('#login-view').hidden = true;
   $('#app-view').hidden = false;
-  $('#me-name').textContent = state.me ? `Signed in as ${state.me.displayName || state.me.username}` : '';
+  $('#me-name').textContent = state.me ? `Signed in as ${state.me.displayName || state.me.username} (${ROLE_LABELS[state.me.role] || state.me.role})` : '';
+  api('GET', '/admin/categories')
+    .then((cats) => $('#kb-categories').replaceChildren(...cats.map((c) => h('option', { value: `category:${c.key}` }, `${c.label} (${c.count} sites)`))))
+    .catch(() => {});
   route();
 }
 
@@ -919,14 +1307,30 @@ $('#login-form').addEventListener('submit', async (e) => {
   const fd = new FormData(e.target);
   $('#login-error').textContent = '';
   try {
-    const r = await api('POST', '/auth/login', { username: fd.get('username'), password: fd.get('password'), kind: 'console', device: 'Admin console' });
+    const body = { username: fd.get('username'), password: fd.get('password'), kind: 'console', device: 'Admin console' };
+    if (fd.get('otp')) body.otp = fd.get('otp');
+    let r;
+    try {
+      r = await api('POST', '/auth/login', body);
+    } catch (err) {
+      if (err.data && err.data.needOtp) {
+        $('#otp-row').hidden = false;
+        $('#login-form [name=otp]').focus();
+      }
+      throw err;
+    }
     state.token = r.token;
     state.me = r.user;
     sessionStorage.setItem('kb_token', r.token);
     sessionStorage.setItem('kb_me', JSON.stringify(r.user));
     e.target.reset();
+    $('#otp-row').hidden = true;
     showApp();
-    if (r.mustChangePassword) changePassword(true);
+    if (r.mustChangePassword) await changePassword(true);
+    if (r.mustEnable2fa) {
+      toast('Your organisation requires two-factor authentication. Please set it up now.');
+      location.hash = '#security';
+    }
   } catch (err) {
     $('#login-error').textContent = err.message;
   }

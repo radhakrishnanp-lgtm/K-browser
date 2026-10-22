@@ -83,9 +83,12 @@ function renderToolbar() {
   $('lock').title = t && t.url.startsWith('http:') ? 'Connection is not secure' : 'Secure connection';
   $('zoom').hidden = !t || t.zoom === 100;
   if (t) $('zoom').textContent = `${t.zoom}%`;
+  const prot = (t && t.protections) || [];
+  $('shield').hidden = !prot.length;
+  $('shield').title = prot.length ? `Company data protection on this site: ${prot.join(', ')}` : '';
   const logins = (t && t.logins) || [];
   $('key').hidden = !logins.length;
-  $('key-label').textContent = t && t.filled ? 'Signed in by K-Browser' : logins.length > 1 ? `${logins.length} managed logins` : 'Managed login';
+  $('key-label').textContent = t && t.filled ? 'Managed login ✓' : logins.length > 1 ? `${logins.length} managed logins` : 'Managed login';
   const n = tabsState.downloads || 0;
   $('dl-count').hidden = !n;
   $('dl-count').textContent = n;

@@ -13,6 +13,7 @@
       <div class="brand"><span class="logo">K</span> K-Browser Admin</div>
       <label>Username <input name="username" autocomplete="username" required autofocus></label>
       <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <label id="otp-row" hidden>Authenticator code <input name="otp" inputmode="numeric" autocomplete="one-time-code" maxlength="6"></label>
       <div class="error" id="login-error"></div>
       <button class="primary" type="submit">Sign in</button>
     </form>
@@ -26,11 +27,20 @@
         <a href="#sessions">Live sessions</a>
         <a href="#users">Users</a>
         <a href="#groups">Groups</a>
+        <a href="#requests">Access requests <span id="req-count" class="pill" hidden></span></a>
+        <div class="nav-h">Accounts &amp; licences</div>
         <a href="#credentials">Site logins</a>
+        <a href="#subscriptions">Subscriptions</a>
+        <div class="nav-h">Policies</div>
         <a href="#filter">Web filter</a>
+        <a href="#dlp">Data protection</a>
         <a href="#bookmarks">Bookmarks</a>
-        <a href="#activity">Activity log</a>
         <a href="#settings">Settings</a>
+        <div class="nav-h">Insights</div>
+        <a href="#activity">Activity log</a>
+        <a href="#reports">Usage reports</a>
+        <div class="nav-h">System</div>
+        <a href="#security">Security</a>
         <a href="#deploy">Deploy clients</a>
       </nav>
       <div class="me">
@@ -42,6 +52,7 @@
     <main id="main"></main>
   </div>
 
+  <datalist id="kb-categories"></datalist>
   <div id="modal-root"></div>
   <div id="toast" class="toast" hidden></div>
   <script src="app.js"></script>

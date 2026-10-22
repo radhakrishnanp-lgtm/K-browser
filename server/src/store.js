@@ -18,6 +18,13 @@ const DEFAULT_SETTINGS = {
   clearDataOnLogout: false,
   idleLogoutMinutes: 0,
   maxTabs: 0,
+  safeSearch: false,
+  youtubeRestrict: 'off',
+  currency: 'INR',
+  requireAdmin2fa: false,
+  webhookUrl: '',
+  webhookEvents: ['blocked', 'access.request', 'login.failed', 'seat.denied', 'dlp.blocked', 'admin.credential.update'],
+  usageRetentionDays: 90,
 };
 
 // Keys that groups and users may override.
@@ -32,6 +39,8 @@ const OVERRIDABLE_SETTINGS = [
   'clearDataOnLogout',
   'idleLogoutMinutes',
   'maxTabs',
+  'safeSearch',
+  'youtubeRestrict',
 ];
 
 function emptyData() {
@@ -44,7 +53,14 @@ function emptyData() {
     groups: [],
     credentials: [],
     sessions: [],
+    dlpRules: [],
+    accessRequests: [],
+    usage: {},
   };
+}
+
+function chainHash(prev, base) {
+  return crypto.createHash('sha256').update(String(prev || '') + JSON.stringify(base)).digest('hex');
 }
 
 function newId() {
@@ -123,6 +139,7 @@ class AuditLog {
     this.rotateBytes = rotateBytes;
     this.entries = [];
     this.listeners = new Set();
+    this.lastHash = '';
     if (fs.existsSync(file)) {
       const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
       for (const line of lines.slice(-keep)) {
@@ -132,11 +149,17 @@ class AuditLog {
           // skip corrupt line
         }
       }
+      const last = this.entries[this.entries.length - 1];
+      if (last && last.hash) this.lastHash = last.hash;
     }
   }
 
   add(entry) {
-    const row = { id: newId(), ts: new Date().toISOString(), ...entry };
+    const base = { id: newId(), ts: new Date().toISOString(), ...entry };
+    // Tamper-evident chain: each entry commits to the previous entry's hash.
+    const prev = this.lastHash;
+    const row = { ...base, prev, hash: chainHash(prev, base) };
+    this.lastHash = row.hash;
     this.entries.push(row);
     if (this.entries.length > this.keep) this.entries.splice(0, this.entries.length - this.keep);
     try {
@@ -150,6 +173,19 @@ class AuditLog {
     }
     for (const fn of this.listeners) fn(row);
     return row;
+  }
+
+  // Re-computes the hash chain over the entries held in memory.
+  verify() {
+    let prev = null;
+    for (let i = 0; i < this.entries.length; i++) {
+      const { prev: p, hash, ...base } = this.entries[i];
+      if (!hash) continue; // entries written before hashing was introduced
+      if (prev !== null && p !== prev) return { ok: false, checked: i, brokenAt: this.entries[i] };
+      if (chainHash(p, base) !== hash) return { ok: false, checked: i, brokenAt: this.entries[i] };
+      prev = hash;
+    }
+    return { ok: true, checked: this.entries.length };
   }
 
   query({ userId, type, q, since, until, limit = 500 } = {}) {
